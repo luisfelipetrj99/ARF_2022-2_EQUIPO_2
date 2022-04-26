@@ -1,1 +1,7 @@
-# ARF_2022-2_EQUIPO_2
+# ARF SEMESTRE 2022 EQUIPO 2
+##INTEGRANTES
+- Franco arraga Daniel
+- Trujillo Jiménez Luis Felipe
+-
+-
+-
