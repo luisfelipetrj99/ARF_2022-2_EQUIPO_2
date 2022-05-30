@@ -1,0 +1,4170 @@
+---
+title: "Tarea 3 Monte-Carlo"
+author: "Equipo 2"
+date: "25/5/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r, echo=FALSE,results='hide'}
+#Cargamos librerias
+setwd('C:/Users/luisf/Documents/Universidad/ARF/Tarea 1+')
+
+library(quantmod)
+library(data.table)
+library("PerformanceAnalytics")
+library(Deriv)
+library(dplyr)
+con = gzcon(url('https://github.com/systematicinvestor/SIT/raw/master/sit.gz', 'rb'))
+source(con)
+close(con)
+```
+
+### Carga de Funciones a utilizar
+
+```{r}
+ #FUNCIÓN DE INTERPOLACIÓN ALAMBRADA
+  
+  talamb=function(nodos,curva,plazos) #función de interpolación de tasas por el método alamabrada
+  {
+    n=max(ncol(plazos),1)
+    m=max(ncol(nodos),1)
+    TC=matrix(0,1,n)
+    TL=matrix(0,1,n)
+    TF=matrix(0,1,n)
+    for (j in 1:n)
+    {
+      i=1
+      repeat
+      {
+        if(nodos[i]<= plazos[j] && plazos[j] <=nodos[i+1])
+        {
+          TC[j]=curva[i]
+          TL[j]=curva[i+1]
+          TF[j]=((((1+TL[j]*nodos[i+1]/360)/(1+TC[j]*nodos[i]/360))^((plazos[j]-nodos[i])/(nodos[i+1]-nodos[i]))*(1+TC[j]*nodos[i]/360))-1)*360/plazos[j]
+          break
+        }
+        else if (plazos[j]<nodos[1])
+        {
+          TC[j]=curva[1]
+          TL[j]=curva[1]
+          TF[j]=curva[1]
+          break
+        }
+        else if (plazos[j]>nodos[m])
+        {
+          TC[j]=curva[m]
+          TL[j]=curva[m]
+          TF[j]=curva[m]
+          break
+        }
+        else
+        {i=i+1}
+      }
+    }
+    as.matrix(t(as.numeric(rbind(TF))))
+  }
+  
+  
+  #funciones necesarias
+  diagv=function(x)			#función para diagonalizar un vector
+  {
+    n01=nrow(as.matrix(x))
+    m01=ncol(as.matrix(x))
+    dimmax=max(n01,m01)
+    res=matrix(0,dimmax,dimmax)
+    for (i in 1:dimmax)
+    {
+      res[i,i]=x[i]
+    }
+    res
+  }
+  
+  #función de cuantil más cercano
+  equantile <- function(v,p=.5,ns=nrow(as.matrix(v))) 
+  { 
+    if ( !is.numeric(p) || any( p<0 | p>1) ) 
+      stop("Percentil tiene que ser 0<=p<=1") 
+    ranking <- order(v) 
+    vw=matrix(0,ns,1)
+    vw[1:ns]=seq(1/ns,ns)  
+    sumw <- cumsum(vw[ranking]) 
+    plist <- sumw / sumw[ length(sumw) ] 
+    v [ ranking [ which.max( plist >= p ) ] ]  
+  } 
+  
+  
+  wquantile <- function(v,w=rep(1,length(v)),p=.5) 
+  { 
+    if ( !is.numeric(w) || length(v) != length(w) ) 
+      stop("Los valores y los pesos tienen que tener misma longitud") 
+    if ( !is.numeric(p) || any( p<0 | p>1) ) 
+      stop("Percentil tiene que ser 0<=p<=1") 
+    if ( min(w) < 0 ) stop("Los pesos tiene que ser mayores que 0") 
+    ranking <- order(v) 
+    sumw <- cumsum(w[ranking]) 
+    plist <- sumw / sumw[ length(sumw) ] 
+    v [ ranking [ which.max( plist >= p ) ] ]  
+  }
+  
+  
+  #CVaR con alisado
+  wcvar <- function(v,w=rep(1,length(v)),p=.5) 
+  { 
+    if ( !is.numeric(w) || length(v) != length(w) ) 
+      stop("Los valores y los pesos tienen que tener misma longitud") 
+    if ( !is.numeric(p) || any( p<0 | p>1) ) 
+      stop("Percentil tiene que ser 0<=p<=1") 
+    if ( min(w) < 0 ) stop("Los pesos tiene que ser mayores que 0") 
+    ranking <- order(v) 
+    sumw <- cumsum(w[ranking]) 
+    plist <- sumw / sumw[ length(sumw) ] 
+    loss= v [ ranking [ which( plist < p ) ] ]  
+    esc=w [ ranking [ which( plist < p ) ] ]  
+    sum(loss*esc)/(sum(esc))
+  } 
+```
+
+### Definir fechas de valoración y  parámetros de activos a evaluar
+
+```{r}
+fval=as.Date("20220313",format="%Y%m%d") #Fecha de valoración
+itpl=0 #poner 0 si se quiere interpolación lineal o 1 si se quiere tasa alambrada
+alpha=0.98 #Nivel de confianza para obtener estimaciones de riesgo
+#setwd(direc)	
+
+################ACCIONES Y DIVISAS#############################
+#Cargar los símbolos de yahoo finance para EQ
+Symbols<-c("AMXL.MX","GCARSOA1.MX", "WALMEX.MX")#tienen que ir en orden alfabético
+pos_eq=c(-5000,1000,1200) #monto inicial invertido en acciones
+#Cargar los símbolos de yahoo finance para FX
+SymbolsFX<-c("EURUSD=X", "GBPUSD=X","USDMXN=X") #tienen que ir en orden alfabético
+pos_fx=c(700,-600, 1500) #monto inicial invertido en divisas
+nh=3660 #días de historia
+
+#############CETES#######################
+#CETES
+base="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_guber.txt"
+plazos_bcc=cbind( 5,	18,	72,	115,	153,	245,	850,	1500,	3000,	6400,	7500,	9958)
+contratos_bcc=cbind(22000, -29000, 10000, -46000, 44000, -26000,-30000,7000,-18000,-31000,23000,-23000)
+nominal_bcc=10 #CETE
+
+###########Bondes y Bonos M###############
+#BONDES D
+btasadescst="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_guber_st.txt"
+btasafondeo="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tfondeo.txt"
+plazos_bdm=cbind(707) #Vencimiento del bono
+plazocupon_bdm=cbind(28) #plazos_bdm fijos de cada cupón
+contratos_bdm=cbind(1000) #posición invertida
+nominal_bdm=1000
+
+#BONOS M
+btasadesc_bm="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_yield.txt"
+tfcupon_bm=cbind( 0.065) #Tasafija del cupón
+plazos_bm=cbind( 3600) #Vencimiento del bono
+plazocupon_bm=cbind( 360) #plazos_bm fijos de cada cupón
+contratos_bm=cbind(1000) #posición invertida
+nominal_bm=1000
+
+#########################Forwards#################
+#FORWARDS Divisas
+bext="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_libor.txt"
+bdom="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_fwd.txt"
+SymbolsFX_ftdc<-c("USDMXN=X","GBPUSD=X") #tienen que ir en orden alfabético
+plazos_fwd=cbind(5)
+contratos_fwd=cbind(100)
+kst_fwd=cbind(20.83)
+nominal_fwd=1
+yext=1 #si se carga información de yahoo en la fecha definida por fval o SymbolsFX, en caso contrario se utiliza información que se tendrá que cargar de tasas_spot.txt
+trlib=1 #1 si la curva libor viene a 182 0 si no.
+
+#FORWARDS DE IPC
+#Descontamos con gubernamental
+base="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_guber.txt"
+SymbolsEQ_find<-SymbolsEQ_find<-c("^MXX", "GCARSOA1.MX") #tienen que ir en orden alfabético
+#tienen que ir en orden alfabético
+plazos_fwd_ind=cbind(53)
+contratos_fwd_ind=cbind(50)
+kst_fwd_ind=cbind(49525)
+nominal_fwd_ind=1
+
+##################SWAPS##########
+#SWAP
+btasadesc_sw="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_TIIE_SW_OP.txt"
+btasacupvar_sw="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_DIRS_SW_OP.txt"
+tasafija_sw=cbind(0.066,.059) #se establece la tasa fija a pagar para cada swap
+plazos_sw=cbind(588,270) #se establece el número de días que vivirá el swap
+plazocupon_sw=cbind(28,28) #se establece el número de días que se pagará cada cupón
+contratos_sw=cbind(1,1) #se establece el número de contratos_sw de cada swap
+nominal_sw=cbind(16000000,12000000) #se establece el nominal_sw de cada swap
+por_sw=cbind(0,1) #se establece 0 si se paga tasa fija y 1 si se paga tasa variable
+
+######################Opciones#########
+#OPCIONES
+btasadesc_oir="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_TIIE_SW_OP.txt"
+btasaspot_oir="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tasa_DIRS_SW_OP.txt"
+bvolspot_oir="ARF_2022-2_EQUIPO_2/Tarea 1/Insumos/tvoltiie_opc.txt"
+plazos_oir=cbind( 1700,	700) #T-t
+pr_oir=28 #plazo de referencia  
+dct_oir=360 #d_base
+cp_oir=cbind(1,0) #si es call (cap) o put (floor)
+K_oir=cbind( 0.058, 0.06)
+contratos_oir=cbind(1000, 500)
+nominal_oir=1
+cs_oir=1 #1 si es continua la tasa 0 si es simple
+
+
+```
+
+## Carga de los datos
+###Acciones
+```{r,echo=FALSE, warning=FALSE}
+#CARGA DE DATOS DE ACCIONES
+pos=cbind(t(pos_fx),t(pos_eq))
+start_date=Sys.Date()-nh #fecha inicial
+#Creación del objeto para guardar los datos
+dataEnv<-new.env()
+dataEnvFX<-new.env()
+#obtener los datos
+getSymbols.yahoo(Symbols,env=dataEnv,from=start_date)
+getSymbols.yahoo(SymbolsFX,env=dataEnvFX,from=start_date)
+#muestra
+#tail(dataEnvFX$`GBPUSD=X`)
+#limpiarlos, alinearnos y quedarnos con el precio de cierre 
+bt.prep(dataEnv,align='remove.na',fill.gaps = T)
+bt.prep(dataEnvFX,align='remove.na',fill.gaps=T)
+#muestra de datos
+#head(dataEnv$prices)
+#head(dataEnvFX$prices)
+#Nos quedamos con los precios
+stock_prices = dataEnv$prices
+#tail(stock_prices[,])
+stock_pricesFX=dataEnvFX$prices
+#tail(stock_pricesFX)
+#cambiar todo a pesos mexicanos
+stock_pricesFX=cbind(stock_pricesFX[,1,with=F]*stock_pricesFX[,3,with=F],stock_pricesFX[,2,with=F]*stock_pricesFX[,3,with=F],stock_pricesFX[,3,with=F])
+#tail(stock_pricesFX)
+stock_prices_EQFX=merge(stock_pricesFX,stock_prices,join = "inner")
+tail(stock_prices_EQFX)
+#Preciso actuales
+#últimos valores
+x0=stock_prices_EQFX[nrow(stock_prices_EQFX),]
+aux2=data.table(Date=as.Date(index(stock_prices_EQFX)),coredata(stock_prices_EQFX))
+```
+### Cetes
+```{r}
+data<-read.table(base)
+n<-nrow(data)
+m_gov=ncol(data)
+#x_orig_gov=data.frame(data[2:n,1:m_gov])
+x_orig_gov=as.data.table(mutate(data[2:n,1:m_gov],Date=as.Date(V1,format="%Y%m%d")))
+x_orig_gov=x_orig_gov%>%select(-V1)
+nodos_gov=data.frame(data[1,2:m_gov])
+
+```
+
+### Bonos M
+```{r}
+data1<-read.table(btasadesc_bm)
+n<-nrow(data1)
+m_tybm=ncol(data1)
+X_orig_tybm=as.data.table(mutate(data1[2:n,1:m_tybm],Date=as.Date(V1,format="%Y%m%d")))
+X_orig_tybm=X_orig_tybm%>%select(-V1)
+nodos_tybm=data.frame(data1[1,2:m_tybm])
+
+
+```
+
+### Bondes D
+```{r}
+##CARGA DE DATOS DE BONDE D
+#carga de datos
+#carga de tasas de descuento
+data1<-read.table(base)
+n<-nrow(data1)
+m_bd=ncol(data1)
+##X_orig_bd=as.data.table(mutate(data1[2:n,1:m_tybm],Date=as.Date(V1,format="%Y%m%d")))
+#X_orig_bd%>%select(-V1)
+
+X1_orig=mutate(data.frame(data1[2:n,1:m_bd]), V1=as.Date(V1,format="%Y%m%d"))
+#nodos=data.frame(data1[1,2:m_bd])
+n=n-1
+
+data3<-read.table(btasadescst)
+n3<-nrow(data3)
+m3_bd=ncol(data3)
+X3_orig_bd=as.data.table(mutate(data3[2:n,1:m3_bd],Date=as.Date(V1,format="%Y%m%d")))
+X3_orig_bd=X3_orig_bd%>%select(-V1)
+
+X3a_orig=mutate(data.frame(data1[2:n,1:m_bd]), V1=as.Date(V1,format="%Y%m%d"))
+nodos3_bd=data.frame(data3[1,2:m3_bd])
+n3=n3-1
+
+data2<-read.table(btasafondeo)
+n2<-nrow(data2)
+X2_orig_bd=data.frame(data2[2:n2,1:2])
+X2_orig_bd=mutate(X2_orig_bd, V1=as.Date(V1,format="%Y%m%d"), Date=as.Date(V1,format="%Y%m%d"), V2=as.numeric(as.character(V2)))
+tfh=seq(min(X2_orig_bd$V1), max(X2_orig_bd$V1), "days") #sucesión de dias para tasa fondeo
+tfhd=data.frame(ID=1:count(tfh),fecha=tfh)
+
+#Cruzar la sucesión de todos los días versus el de tasa de fondeo
+tfhd=setDT(tfhd)[, Date := tfh][order(-Date)]
+X2_orig_bd=setDT(X2_orig_bd)[, Date := V1][order(-Date)]
+# rolling join unión por rolling, rellena las fechas que faltaban con el último valor conocido "roll=Inf"
+X2_orig_bd=X2_orig_bd[tfhd, on = .(Date), roll = Inf] 
+#buscar fecha de valuación en tfondeo
+tf_act=X2_orig_bd[fecha==fval,]$V2/100
+tf_int=X2_orig_bd[fecha<=fval & fecha>=(fval-plazocupon_bdm[1])]$V2/100
+
+X1_orig=setDT(X1_orig)[, Date:= V1][order(-Date)] #Para alinear con valor presente y tasa de fondeo.
+
+```
+
+
+### Forwards de Divisas
+```{r, warning=FALSE}
+#datas
+#data<-read.table("tasa_tiie.txt")
+data1<-read.table(bext)
+data2<-read.table(bdom)
+
+########minimos para parametrizar
+n1=nrow(data1)
+n2=nrow(data2)
+m1_ftdc=ncol(data1)
+m2_ftdc=ncol(data2)
+n=min(n1,n2)-1
+###NODOS###
+nodos1_ftdc=data.frame(data1[1,2:m1_ftdc])
+nodos2_ftdc=data.frame(data2[1,2:m2_ftdc])
+####MATRICES DEL MISMO TAMAÑO MENOS DOLAR
+
+x1_ftdc=as.data.table(mutate(data1[2:n,1:m1_ftdc],Date=as.Date(V1,format="%Y%m%d")))
+x1_ftdc=x1_ftdc%>%select(-V1)
+x2_ftdc=as.data.table(mutate(data2[2:n,1:m2_ftdc],Date=as.Date(V1,format="%Y%m%d")))
+x2_ftdc=x2_ftdc%>%select(-V1)
+
+###Para Dolar
+
+if (yext==1)
+{
+  #Cargar los símbolos de yahoo finance para FX
+  start_date=fval-3660 #fecha inicial
+  
+  #Creación del objeto para guardar los datos
+  dataEnvFX<-new.env()
+  
+  #obtener los datos
+  getSymbols.yahoo(SymbolsFX_ftdc,env=dataEnvFX,from=start_date, to=(fval))
+  #limpiarlos, alinearnos y quedarnos con el precio de cierre 
+  bt.prep(dataEnvFX,align='remove.na',fill.gaps=T)
+  
+  #muestra de datos
+  head(dataEnvFX$prices[,2])
+  
+  #Nos quedamos con los precios
+  X3_ftdc=data.table(Date=as.Date(index(dataEnvFX$prices[,2])),coredata(dataEnvFX$prices[,2]))
+} else  
+{ 
+data3<-read.table(btsp)
+print(head(data3))
+n3<-nrow(data3)
+m3<-ncol(data3)
+X3=data.table(as.matrix(as.double(as.matrix(data3[2:(n+1),m3]))))
+X3_find=as.data.table(mutate(data3[2:(n+1),1:m3],Date=as.Date(V1,format="%Y%m%d")))
+}
+
+#tail(X3_find)
+```
+
+### Forwards IPC
+
+```{r,warning=FALSE}
+# CARGA DE DATOS DE  FORWARD DE IPC
+
+data<-read.table(base)
+n<-nrow(data)
+m_gov=ncol(data)
+#x_orig_gov=data.frame(data[2:n,1:m_gov])
+x_orig_gov=as.data.table(mutate(data[2:n,1:m_gov],Date=as.Date(V1,format="%Y%m%d")))
+x_orig_gov=x_orig_gov%>%select(-V1)
+nodos_gov=data.frame(data[1,2:m_gov])
+
+  #Cargar los símbolos de yahoo finance para EQ
+  start_date=fval-nh #fecha inicial
+  
+  #Creación del objeto para guardar los datos
+  dataEnvEQ<-new.env()
+  
+  #obtener los datos
+  getSymbols.yahoo(SymbolsEQ_find,env=dataEnvEQ,from=start_date, to=(fval))
+  #limpiarlos, alinearnos y quedarnos con el precio de cierre 
+  bt.prep(dataEnvEQ,align='remove.na',fill.gaps=T)
+  
+  #muestra de datos
+#  head(dataEnvEQ$prices)
+  
+  #Nos quedamos con los precios
+  X3_find=data.table(Date=as.Date(index(dataEnvEQ$prices[,2])),coredata(dataEnvEQ$prices[,2]))
+  
+tail(X3_find)
+
+```
+### Swaps
+```{r}
+#CARGA DE DATOS PARA SWAP
+  data1<-read.table(btasadesc_sw)
+  n1<-nrow(data1)
+  m1_orig_sw=ncol(data1)
+  X1_orig_sw=data.table(mutate(data1[2:n1,1:m1_orig_sw],Date=as.Date(V1,format="%Y%m%d")))
+  X1_orig_sw=X1_orig_sw%>%select(-V1)
+  nodos1_sw=data.frame(data1[1,2:m1_orig_sw])
+  
+  data2<-read.table(btasacupvar_sw)
+  n2<-nrow(data2)
+  m2_orig_sw=ncol(data2)
+  X2_orig_sw=data.table(mutate(data2[2:n1,1:m1_orig_sw],Date=as.Date(V1,format="%Y%m%d")))
+  X2_orig_sw=X2_orig_sw%>%select(-V1)
+  nodos2_sw=data.frame(data2[1,2:m2_orig_sw])
+  
+```
+
+
+### Opciones Tasa de interés
+
+```{r}
+ #CARGA DE DATOS PARA OPCIONES DE TASA DE INTERÉS
+  #carga de datos
+  #carga de rho	
+  data1<-read.table(btasadesc_oir) 
+  n<-nrow(data1)
+  m1_orig_oir=ncol(data1)
+  x1_orig_oir=data.table(mutate(data1[2:n,1:m1_orig_oir],Date=as.Date(V1,format="%Y%m%d")))
+  x1_orig_oir=x1_orig_oir%>%select(-V1)
+  nodos1_oir=data.frame(data1[1,2:m1_orig_oir])
+  
+  #data1[1:3,]
+  #carga de tasas spot
+  data2<-read.table(btasaspot_oir)
+  n<-nrow(data2)
+  m2_orig_oir=ncol(data2)
+  x2_orig_oir=data.table(mutate(data2[2:n,1:m2_orig_oir],Date=as.Date(V1,format="%Y%m%d")))
+  x2_orig_oir=x2_orig_oir%>%select(-V1)
+  nodos2_oir=data.frame(data2[1,2:m2_orig_oir])
+  #carga de volatilidades de spot
+  data3<-read.table(bvolspot_oir)
+  n<-nrow(data3)
+  m3_orig_oir=ncol(data3)
+  x3_orig_oir=data.table(mutate(data3[2:n,1:m3_orig_oir],Date=as.Date(V1,format="%Y%m%d")))
+  x3_orig_oir=x3_orig_oir%>%select(-V1)
+  
+  nodos3_oir=data.frame(data3[1,2:m3_orig_oir])
+
+```
+
+## Integración de insumos
+
+```{r}
+#INTERSECCIÓN DE FECHAS DE TODOS LOS INSUMOS    
+  
+lin_gub=data.table(Date=as.Date(aux2[x_orig_gov,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity y guber
+lin_gub=unique(lin_gub)
+lin_gub_bmy=data.table(Date=as.Date(lin_gub[X_orig_tybm,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity y guber, con bonos M
+lin_gub_bmy=unique(lin_gub_bmy)
+lin_gub_bmybdst=data.table(Date=as.Date(lin_gub_bmy[X3_orig_bd,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber y st (bonde)
+lin_gub_bmybdst=unique(lin_gub_bmybdst)
+lin_gub_bmybdst_flib=data.table(Date=as.Date(lin_gub_bmybdst[x1_ftdc,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor
+lin_gub_bmybdst_flib=unique(lin_gub_bmybdst_flib)
+lin_gub_bmybdst_flibfwd=data.table(Date=as.Date(lin_gub_bmybdst_flib[x2_ftdc,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd
+lin_gub_bmybdst_flibfwd=unique(lin_gub_bmybdst_flibfwd)
+lin_gub_bmybdst_flibfwdsp=data.table(Date=as.Date(lin_gub_bmybdst_flibfwd[X3_ftdc,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot
+lin_gub_bmybdst_flibfwdsp=unique(lin_gub_bmybdst_flibfwdsp)
+lin_gub_bmybdst_flibfwdspind=data.table(Date=as.Date(lin_gub_bmybdst_flibfwdsp[X3_find,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot, equity or index 
+lin_gub_bmybdst_flibfwdspind=unique(lin_gub_bmybdst_flibfwdspind)
+lin_gub_bmybdst_flibfwdspind_swcup=data.table(Date=as.Date(lin_gub_bmybdst_flibfwdspind[X1_orig_sw,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot, equity or index, swap cupón
+lin_gub_bmybdst_flibfwdspind_swcup=unique(lin_gub_bmybdst_flibfwdspind_swcup)
+lin_gub_bmybdst_flibfwdspind_swcupvp=data.table(Date=as.Date(lin_gub_bmybdst_flibfwdspind_swcup[X2_orig_sw,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot, equity or index, swap cupón
+lin_gub_bmybdst_flibfwdspind_swcupvp=unique(lin_gub_bmybdst_flibfwdspind_swcupvp)
+lin_gub_bmybdst_flibfwdspind_swcupvp_oirs=data.table(Date=as.Date(lin_gub_bmybdst_flibfwdspind_swcupvp[x1_orig_oir,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot, equity or index, swap cupón, opciones ir spot
+lin_gub_bmybdst_flibfwdspind_swcupvp_oirs=unique(lin_gub_bmybdst_flibfwdspind_swcupvp_oirs)
+lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvp=data.table(Date=as.Date(lin_gub_bmybdst_flibfwdspind_swcupvp_oirs[x2_orig_oir,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot, equity or index, swap cupón, opciones ir spot, opc ir vp
+lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvp=unique(lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvp)
+lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol=data.table(Date=as.Date(lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvp[x3_orig_oir,on=.(Date),nomatch=0]$Date)) #Fechas acciones, equity, guber, st (bonde), libor, fwd, spot, equity or index, swap cupón, opciones ir spot, opc ir vp, opc ir vol
+lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol=unique(lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol)
+
+n=nrow(lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol) #Historia de todos
+print(n)
+
+#historia de acciones y divisas
+stock_prices_EQFX=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[aux2,on=.(Date),nomatch=0][order(-Date)]
+stock_prices_EQFX=stock_prices_EQFX%>%select(-Date)
+
+#historia de curva gubernamental
+x_orig_gov=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[x_orig_gov,on=.(Date),nomatch=0][order(-Date)]
+x_orig_gov=x_orig_gov%>%select(-Date)
+
+#historia de curva yield
+X_orig_tybm=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X_orig_tybm,on=.(Date),nomatch=0][order(-Date)]
+X_orig_tybm=X_orig_tybm%>%select(-Date)
+
+
+#Historia de curvas de bonde
+#CONSIDERAR LA CURVA GUBERNAMENTAL X1_ORIG_GOV
+X3_orig_bd=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X3_orig_bd,on=.(Date),nomatch=0][order(-Date)]
+X3_orig_bd=X3_orig_bd%>%select(-Date)
+
+
+#historia de curvas de forward tdc
+x1_ftdc=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[x1_ftdc,on=.(Date),nomatch=0][order(-Date)]
+x1_ftdc=x1_ftdc%>%select(-Date)/100
+x2_ftdc=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[x2_ftdc,on=.(Date),nomatch=0][order(-Date)]
+x2_ftdc=x2_ftdc%>%select(-Date)/100
+X3_ftdc=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X3_ftdc,on=.(Date),nomatch=0][order(-Date)]
+X3_ftdc=X3_ftdc%>%select(-Date)
+
+#historia de curvas de forward ind
+#CONSIDERAR LA CURVA GUBERNAMENTAL X1_ORIG_GOV
+X3_find=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X3_find,on=.(Date),nomatch=0][order(-Date)]
+X3_find=X3_find%>%select(-Date)
+
+#historia de swaps
+X1_orig_sw=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X1_orig_sw,on=.(Date),nomatch=0][order(-Date)]
+X1_orig_sw=X1_orig_sw%>%select(-Date)/100
+X2_orig_sw=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X2_orig_sw,on=.(Date),nomatch=0][order(-Date)]
+X2_orig_sw=X2_orig_sw%>%select(-Date)/100
+
+#historia de opciones
+x1_orig_oir=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[x1_orig_oir,on=.(Date),nomatch=0][order(-Date)]
+x1_orig_oir=x1_orig_oir%>%select(-Date)/100
+x2_orig_oir=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[x2_orig_oir,on=.(Date),nomatch=0][order(-Date)]
+x2_orig_oir=x2_orig_oir%>%select(-Date)/100
+x3_orig_oir=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[x3_orig_oir,on=.(Date),nomatch=0][order(-Date)]
+x3_orig_oir=x3_orig_oir%>%select(-Date)
+```
+Tenemos 241 factores de riesgo
+
+# Medición del riesgo Por método de simulación Monte Carlo
+
+Para todos los instrumentos hay que definir y calcular los siguientes elementos:
+
+1.Historico de factores de riesgo
+
+2.Vector de precios actual
+
+3.Valoración al día actual
+
+## Histórico de factores de riesgo
+### Acciones y Divisas
+```{r}
+x0_acc_div=stock_prices_EQFX[1,] 
+V0_acc_div=cbind(t(pos_fx),t(pos_eq))*x0_acc_div
+m_fx=length(pos_fx)
+m_acc=length(pos_eq)
+```
+
+### Cetes
+```{r}
+#CETE CÁLCULO
+#paso para interpolar las tasas
+m=ncol(plazos_bcc)
+x_bcc=matrix(0,n,m)
+for (i in 1:(n))
+{
+  #x[i,]=approx(nodos_gov,x_orig_gov[i,],plazos_bcc)$y
+  x_bcc[i,]=if(itpl==0){approx(nodos_gov,x_orig_gov[i,],plazos_bcc,rule=2)$y}else{talamb(nodos_gov,x_orig_gov[i,],plazos_bcc)}
+}
+
+x0_bcc=x_bcc[1,]
+
+#función
+bonocupcero = function(i,t)
+{
+  1/(1+i*t/360)
+}
+
+V0_bcc=as.matrix(bonocupcero(x0_bcc,plazos_bcc))*contratos_bcc*nominal_bcc #Valor actual de cada bono
+
+VT0_bcc=sum(V0_bcc) #Valor total del portafolio al tiempo 0
+
+```
+
+### Bono cupón cero
+```{r}
+#BONO M  CÁLCULO
+#Posición inicial
+#interpolación de tasas y volatilidades
+m=ncol(plazos_bm)
+X_bm=matrix(0,n,m)
+for (i in 1:(n))
+{
+  X_bm[i,]=if(itpl==0){approx(nodos_tybm,X_orig_tybm[i,],plazos_bm,rule=2)$y}else{talamb(nodos_tybm,X_orig_tybm[i,],plazos_bm)}
+}
+
+
+
+#Función de valoración por tasa yield
+bonoMyield=function(x, plazos_bm, plazocupon_bm, tfcupon_bm, nominal_bm, contratos_bm) #valoración bono tasa fija
+{
+  N=as.integer(plazos_bm/plazocupon_bm)+1   
+  a=(1-(1+x*plazocupon_bm/360)^(-N))/(plazocupon_bm*x/360)
+  p1=plazos_bm-plazocupon_bm*(N-1)   
+  ((contratos_bm*nominal_bm*tfcupon_bm*plazocupon_bm/360)*a+(contratos_bm*nominal_bm)/((1+x*plazocupon_bm/360)^N))*(1+x*plazocupon_bm/360)^(1-p1/plazocupon_bm)   
+}
+
+x0_bm=t(as.matrix(X_bm[1,])) #tasas de descuento valor actual
+V0_bm=bonoMyield(x0_bm,plazos_bm, plazocupon_bm, tfcupon_bm, nominal_bm, contratos_bm)
+
+```
+
+### Bondes D
+```{r}
+#BONDE D CÁLCULO
+
+X2_pr=lin_gub_bmybdst_flibfwdspind_swcupvp_oirsvpvol[X2_orig_bd, on = .(Date),nomatch=0][order(-Date)] #Se alinea la tasa de fondeo por fecha con la tasa de valor presente.
+m=ncol(plazos_bdm)
+
+
+N_bd=as.integer(plazos_bdm/plazocupon_bdm)+1 #número de cupones a pagar
+VTplazos_bdm=matrix(0,1,sum(N_bd)) #vector de todos los plazos_bdm de todos los contratos_bdm
+contratos_bdmT=matrix(0,1,sum(N_bd)) #vector de todos los contratos_bdm de todos los flujos de todos los contratos_bdm
+nominal_bdmT=matrix(0,1,sum(N_bd)) #vector de todos los nominal_bdmes de todos los flujos de todos los contratos_bdm
+plazocupon_bdmT=matrix(0,1,sum(N_bd)) #vector de todos los plazos_bdmcupon de todos los flujos de todos los contratos_bdm
+tasafijaT_bd=matrix(0,1,sum(N_bd)) #vector de tasas fijas de todos los flujos de todos los contratos_bdm
+ulNomT_bd=matrix(0,1,sum(N_bd)) #vector de contratos_bdm a final de flujo
+
+
+plazini_bd=plazos_bdm-plazocupon_bdm*(N_bd-1) #vector de plazos_bdm iniciales
+ddv=plazocupon_bdm-plazini_bd #dias trasncurridos del cupón vigente
+tfcupon=matrix(0,1,m)  #El primero cupón de cada bono
+tfcupondev=matrix(0,1,m) #cupón de los días devengados
+tfcupgen=((1+tf_act/360)^(plazocupon_bdm[1])-1)*360/plazocupon_bdm[1] #el segundo al último cupón de todos los bonos
+#calcula cupones de bonos
+for (j in (1:m))
+{
+  tfcupondev[j]=(prod(1+tf_int[(1:ddv[j])]/360)-1)*360/ddv[j]
+  tfcupon[j]=((1+tfcupondev[j]*ddv[j]/360)*(1+tf_act/360)^(plazocupon_bdm[1]-ddv[j])-1)*360/plazocupon_bdm[1]
+}
+
+
+for (j in (1:m))
+{
+  if (j==1)
+  {
+    VTplazos_bdm[,1:sum(N_bd[1:j])]=seq(plazini_bd[j],plazos_bdm[j], by=plazocupon_bdm[j])
+    contratos_bdmT[,1:sum(N_bd[1:j])]=seq(contratos_bdm[j],contratos_bdm[j])
+    plazocupon_bdmT[,1:sum(N_bd[1:j])]=seq(plazocupon_bdm[j],plazocupon_bdm[j])
+    ulNomT_bd[,sum(N_bd[1:j])]=contratos_bdm[j]
+    tasafijaT_bd[,1]=tfcupon[j]
+    tasafijaT_bd[,2:sum(N_bd[1:j])]=seq(tfcupgen,tfcupgen)
+  }
+  else
+  {
+    VTplazos_bdm[,(sum(N_bd[1:j-1])+1):sum(N_bd[1:j])]=seq(plazini_bd[j],plazos_bdm[j], by=plazocupon_bdm[j])
+    contratos_bdmT[,(sum(N_bd[1:j-1])+1):sum(N_bd[1:j])]=seq(contratos_bdm[j],contratos_bdm[j])					
+    plazocupon_bdmT[,(sum(N_bd[1:j-1])+1):sum(N_bd[1:j])]=seq(plazocupon_bdm[j],plazocupon_bdm[j])
+    tasafijaT_bd[,(sum(N_bd[1:j-1])+1)]=tfcupon[j]
+    tasafijaT_bd[,(sum(N_bd[1:j-1])+2):sum(N_bd[1:j])]=seq(tfcupgen,tfcupgen)
+    ulNomT_bd[,sum(N_bd[1:j])]=contratos_bdm[j]
+  }
+}
+
+Xvp_bd=matrix(0,n,ncol(VTplazos_bdm))
+Xst_bd=matrix(0,n,ncol(VTplazos_bdm))
+
+for (i in (1:n))
+{
+  Xvp_bd[i,]=if(itpl==0){approx(nodos_gov,x_orig_gov[i,],VTplazos_bdm,rule=2)$y}else{talamb(nodos_gov,x_orig_gov[i,],VTplazos_bdm)}
+  Xst_bd[i,]=if(itpl==0){approx(nodos3_bd,X3_orig_bd[i,],VTplazos_bdm,rule=2)$y}else{talamb(nodos3_bd,X3_orig_bd[i,],VTplazos_bdm)}
+  
+}
+
+X_bd_tc=matrix(1,n,ncol(contratos_bdmT))*X2_pr$V2/100
+X_bd_ext=cbind(X_bd_tc,as.matrix(Xvp_bd),as.matrix(Xst_bd))
+
+bondeD=function(contratos_bdmT,  nominal_bdm, tf_act, plazocupon_bdmT, VTplazos_bdm, Xvp, Xst, N,ddv)
+{
+  tfcupon=matrix(0,1,m)  #El primero cupón de cada bono
+  tfcupondev=matrix(0,1,m) #cupón de los días devengados
+  tfcupgen=((1+tf_act/360)^(plazocupon_bdm[1])-1)*360/plazocupon_bdm[1] #el segundo al último cupón de todos los bonos
+  tasafijaT=matrix(0,1,sum(N))
+  #calcula cupones de bonos
+  for (j in (1:m))
+  {
+    tfcupondev[j]=(prod(1+tf_int[(1:ddv[j])]/360)-1)*360/ddv[j]
+    tfcupon[j]=((1+tfcupondev[j]*ddv[j]/360)*(1+tf_act/360)^(plazocupon_bdm[1]-ddv[j])-1)*360/plazocupon_bdm[1]
+  }
+  
+  
+  for (j in (1:m))
+  {
+    if (j==1)
+    {
+      tasafijaT[,1]=tfcupon[j]
+      tasafijaT[,2:sum(N[1:j])]=seq(tfcupgen,tfcupgen)
+    }
+    else
+    {
+      tasafijaT[,(sum(N[1:j-1])+1)]=tfcupon[j]
+      tasafijaT[,(sum(N[1:j-1])+2):sum(N[1:j])]=seq(tfcupgen,tfcupgen)
+    }
+  }
+  
+  
+  V0=matrix(0,1,count(N))
+  V0f=((((contratos_bdmT*(tasafijaT)*(plazocupon_bdmT/360))+ulNomT_bd)/(1+(Xvp+Xst)*VTplazos_bdm/360)))*nominal_bdm
+  for (j in (1:count(N)))
+  {
+    if(j==1)
+    {
+      V0[j]=sum(V0f[j:N[j]])
+    }
+    else
+    {
+      V0[j]=sum(V0f[(sum(N[1:j-1])+1):(sum(N[1:j]))])
+    }
+  }
+  V0
+} 
+
+
+
+V0_bd=bondeD(contratos_bdmT, nominal_bdm, tf_act, plazocupon_bdmT, VTplazos_bdm, Xvp_bd[1,], Xst_bd[1,], N_bd,ddv)
+```
+
+### Forwards ripo de cambio
+
+```{r}
+#FORWARDS Y/O FUTUROS DE TIPO DE CAMBIO CÁLCULO
+
+################MATRICES DE INTERPOLACION LINEAL ####################
+
+m=ncol(plazos_fwd)
+X1_fwtdc=matrix(0,n,m)
+X2_fwtdc=matrix(0,n,m)
+
+for (j in 1:n)
+{
+  X1_fwtdc[j,]=if(itpl==0){approx(nodos1_ftdc,x1_ftdc[j,],plazos_fwd,rule=2)$y}else{talamb(nodos1_ftdc,x1_ftdc[j,],plazos_fwd)}
+  X2_fwtdc[j,]=if(itpl==0){approx(nodos2_ftdc,x2_ftdc[j,],plazos_fwd,rule=2)$y}else{talamb(nodos2_ftdc,x2_ftdc[j,],plazos_fwd)}
+  if(trlib==1){X1_fwtdc[j,]=((1+X1_fwtdc[j,])^(plazos_fwd/180)-1)*360/plazos_fwd} #transformación de act 180 a 360
+}
+
+
+futuroTC = function(t,tl,tn,s,k) #t=dias por vencer, tn=tasa nacional para tipo de cambio forward, tl= tasa extranjera pra tipo de cambio forward, S=spot
+{
+  f=s*((1+tn*t/360)/(1+tl*t/360)) #Se obtiene el tipo de cambio forward
+  t(as.numeric((f-k)/(1+t*tn/360))) #Se obtiene el valor del payoff a valor presente con el valor z que define si es largo o corto
+}
+
+X3_ftdc=as.matrix(X3_ftdc)
+X_futtdc=cbind(X1_fwtdc,X2_fwtdc,X3_ftdc)
+
+V0_fwtdc=futuroTC(plazos_fwd,X1_fwtdc[1,],X2_fwtdc[1,],X3_ftdc[1,],kst_fwd)*contratos_fwd*nominal_fwd
+
+```
+
+
+### Forwards acciones o índices
+```{r}
+#FORWARDS Y/O FUTUROS DE ÍNDICES CÁLCULO
+
+################MATRICES DE INTERPOLACION LINEAL ####################
+
+m_ind=ncol(plazos_fwd_ind)
+X1_fwind=matrix(0,n,m_ind) #DIVIDENDOS
+X2_fwind=matrix(0,n,m_ind)
+
+for (j in 1:n)
+{
+  #X1_fwind[j,]=if(itpl==0){approx(nodos1_,x1_ftdc[j,],plazos_fwd)$y}else{talamb(nodos1_ftdc,x1_ftdc[j,],plazos_fwd)}
+  X2_fwind[j,]=if(itpl==0){approx(nodos_gov,x_orig_gov[j,],plazos_fwd_ind,rule=2)$y}else{talamb(nodos_gov,x_orig_gov[j,],plazos_fwd_ind)}
+  #if(trlib==1){X1_fwtdc[j,]=((1+X1_fwtdc[j,])^(plazos_fwd/180)-1)*360/plazos_fwd} #transformación de act 180 a 360
+}
+
+X3_find=as.matrix(X3_find)
+X_futind=cbind(X1_fwind,X2_fwind,matrix(X3_find,n,ncol(X1_fwind)))
+
+V0_fwind=futuroTC(plazos_fwd_ind,X1_fwind[1,],X2_fwind[1,],X3_find[1,],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+```
+
+### SWAPS
+
+```{r}
+##SWAP TASA FIJA VS TASA VARIABLE CÁLCULO
+
+##Interpolamos
+
+nodosvp=nodos1_sw
+nodostc=nodos2_sw
+curvavp=as.matrix(X1_orig_sw)
+curvatc=X2_orig_sw
+n1=nrow(curvavp)
+n2=nrow(curvatc)
+
+
+m=max(ncol(plazos_sw),1) #número de contratos_sw swap a valorar
+N=matrix(0,1,m) #es un vector de m valores donde se cargarán los m número de cupones a pagar para cada contrato
+for (j in (1:m))
+{
+  N[j]=as.integer(plazos_sw[j]/plazocupon_sw[j])+1 #número de cupones a pagar
+}
+VTplazos_sw=matrix(0,1,sum(N)) #vector de todos los plazos_sw de todos los contratos_sw
+contratos_swT=matrix(0,1,sum(N)) #vector de todos los contratos_sw de todos los flujos de todos los contratos_sw
+nominal_swT=matrix(0,1,sum(N)) #vector de todos los nominal_swes de todos los flujos de todos los contratos_sw
+por_swT=matrix(0,1,sum(N)) #vector de todos los dummy si paga o recibe de todos los flujos de todos los contratos_sw
+plazocupon_swT=matrix(0,1,sum(N)) #vector de todos los plazos_swcupon de todos los flujos de todos los contratos_sw
+tasafija_swT=matrix(0,1,sum(N)) #vector de tasas fijas de todos los flujos de todos los contratos_sw
+VTplazos_swc=matrix(0,1,sum(N)) #vector de todos los plazos_sw cortos de todos los contratos_sw
+
+
+plazini=plazos_sw-plazocupon_sw*(N-1) #vector de plazos_sw iniciales
+
+for (j in (1:m))
+{
+  if (j==1)
+  {
+    VTplazos_sw[,1:sum(N[1:j])]=seq(plazini[j],plazos_sw[j], by=plazocupon_sw[j])
+    VTplazos_swc[,1:sum(N[1:j])]=c(0,VTplazos_sw[,1:(sum(N[1:j])-1)])
+    contratos_swT[,1:sum(N[1:j])]=seq(contratos_sw[j],contratos_sw[j])
+    nominal_swT[,1:sum(N[1:j])]=seq(nominal_sw[j],nominal_sw[j])
+    por_swT[,1:sum(N[1:j])]=seq(por_sw[j],por_sw[j])
+    plazocupon_swT[,1:sum(N[1:j])]=seq(plazocupon_sw[j],plazocupon_sw[j])
+    tasafija_swT[,1:sum(N[1:j])]=seq(tasafija_sw[j],tasafija_sw[j])
+  }
+  else
+  {
+    VTplazos_sw[,(sum(N[1:j-1])+1):sum(N[1:j])]=seq(plazini[j],plazos_sw[j], by=plazocupon_sw[j])
+    VTplazos_swc[,(sum(N[1:j-1])+1):sum(N[1:j])]=c(0,VTplazos_sw[,(sum(N[1:j-1])+1):(sum(N[1:j])-1)])
+    contratos_swT[,(sum(N[1:j-1])+1):sum(N[1:j])]=seq(contratos_sw[j],contratos_sw[j])					
+    nominal_swT[,(sum(N[1:j-1])+1):sum(N[1:j])]=seq(nominal_sw[j],nominal_sw[j])
+    por_swT[,(sum(N[1:j-1])+1):sum(N[1:j])]=seq(por_sw[j],por_sw[j])
+    plazocupon_swT[,(sum(N[1:j-1])+1):sum(N[1:j])]=seq(plazocupon_sw[j],plazocupon_sw[j])
+    tasafija_swT[,(sum(N[1:j-1])+1):sum(N[1:j])]=seq(tasafija_sw[j],tasafija_sw[j])
+  }
+}
+
+
+Xvp=matrix(0,n,ncol(VTplazos_sw))
+Xtc=matrix(0,n,ncol(VTplazos_sw))
+Xtcc=matrix(0,n,ncol(VTplazos_sw))
+XtfwdT=matrix(0,n,ncol(VTplazos_sw))
+
+for (i in (1:n))
+{
+  Xvp[i,]=if(itpl==0){approx(nodosvp,curvavp[i,],VTplazos_sw,rule=2)$y}else{talamb(nodosvp,curvavp[i,],VTplazos_sw)}
+  Xtc[i,]=if(itpl==0){approx(nodostc,curvatc[i,],VTplazos_sw,rule=2)$y}else{talamb(nodostc,curvatc[i,],VTplazos_sw)}
+  Xtcc[i,]=if(itpl==0){approx(nodostc,curvatc[i,],VTplazos_swc, rule=2)$y}else{talamb(nodostc,curvatc[i,],VTplazos_swc)}
+  
+  XtfwdT[i,]=((1+Xtc[i,]*VTplazos_sw/360)/(1+Xtcc[i,]*VTplazos_swc/360)-1)*360/plazocupon_swT 
+  for (j in (1:ncol(VTplazos_sw)))
+  {
+    if (VTplazos_sw[j]<= plazocupon_swT[j])
+    {
+      XtfwdT[i,j]=Xtc[i,j]
+    }
+    else
+    {
+      j=sum(N[1:j])
+    }
+  }
+}
+
+X_sw=cbind(XtfwdT,Xvp)
+
+swap=function(por_swT, contratos_swT, nominal_swT, XtfwdT, tasafija_swT, plazocupon_swT, VTplazos_sw, Xvp, N)
+{
+  V0=matrix(0,1,ncol(N))
+  V0f=(((contratos_swT*(XtfwdT-tasafija_swT)*(plazocupon_swT/360)))/(1+Xvp*VTplazos_sw/360))*nominal_swT*(-1)^por_swT
+  for (j in (1:ncol(N)))
+  {
+    if(j==1)
+    {
+      V0[j]=sum(V0f[j:N[j]])
+    }
+    else
+    {
+      V0[j]=sum(V0f[(sum(N[1:j-1])+1):(sum(N[1:j]))])
+    }
+  }
+  V0
+}
+
+V0_sw=swap(por_swT, contratos_swT, nominal_swT, XtfwdT[1,], tasafija_swT, plazocupon_swT, VTplazos_sw, Xvp[1,], N)
+```
+
+### Opciones de tasa de interés
+```{r}
+##opciones de tasa de interés, con inicio el día de la valuación CÁLCULO
+#Posición inicial
+
+#interpolación de tasas y volatilidades
+m=ncol(plazos_oir)
+x1=matrix(0,n,m)
+x2tc=matrix(0,n,m)
+x2tl=matrix(0,n,m)
+x2=matrix(0,n,m)
+x3=matrix(0,n,m)
+for (i in 1:(n))
+{
+  x1[i,]=if(itpl==0){approx(nodos1_oir,x1_orig_oir[i,],plazos_oir,rule=2)$y}else{talamb(nodos1_oir,x1_orig_oir[i,],plazos_oir)}
+  x2tc[i,]=if(itpl==0){approx(nodos2_oir,x2_orig_oir[i,],plazos_oir,rule=2)$y}else{talamb(nodos2_oir,x2_orig_oir[i,],plazos_oir)}
+  x2tl[i,]=if(itpl==0){approx(nodos2_oir,x2_orig_oir[i,],(plazos_oir+pr_oir),rule=2)$y}else{talamb(nodos2_oir,x2_orig_oir[i,],(plazos_oir+pr_oir))}
+  x3[i,]=if(itpl==0){approx(nodos3_oir,x3_orig_oir[i,],plazos_oir,rule=2)$y}else{talamb(nodos3_oir,x3_orig_oir[i,],plazos_oir)}
+  x2[i,]=((1+x2tl[i,]*(plazos_oir+pr_oir)/360)/(1+x2tc[i,]*(plazos_oir)/360)-1)*360/pr_oir
+}
+
+
+x01=x1[1,] #tasas de descuento
+x02=x2[1,] #tasas spot
+x03=x3[1,] #volatilidades
+
+X_oir=cbind(x1,x2,x3)
+
+opctint = function(d,S,K_oir,vol,t,cp_oir,cs_oir,pr_oir,dct_oir)	#función de una opción europea
+{
+  d1=if(cs_oir==1){(log(S/K_oir)+vol^2*t/(365*2))*(1/(vol*sqrt(t/365)))}else{(log(S/K_oir)+vol^2*t/(360*2))*(1/(vol*sqrt(t/360)))}
+  d2=if(cs_oir==1){(log(S/K_oir)-vol^2*t/(365*2))*(1/(vol*sqrt(t/365)))}else{(log(S/K_oir)-vol^2*t/(360*2))*(1/(vol*sqrt(t/360)))}
+  vp=if(cs_oir==1){log(1+d*t/360)*365/t}else{d}  
+  (if(cs_oir==1){(S*pnorm(d1*(-1)^cp_oir)-K_oir*pnorm(d2*(-1)^cp_oir))*(exp(-vp*t/365))*(-1)^cp_oir}else{(S*pnorm(d1*(-1)^cp_oir)-K_oir*pnorm(d2*(-1)^cp_oir))*(1/(1+vp*t/360))*(-1)^cp_oir})*(pr_oir/dct_oir)/(1+S*pr_oir/dct_oir)
+}
+
+
+V0_oir=opctint(x01,x02,K_oir,x03,plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio
+
+```
+
+## Integración de factores y cálculo de riesgo en conjunto, y aplicación de simulación
+
+### Por Cholesky Empírico
+```{r}
+#DIMENSION DE TODOS LOS INSTRUMENTOS
+#Son 8 instrumentos financieros (9 si separamos acciones y divisas)
+n_if=matrix(0,8,1)
+n_if[1]=ncol(stock_prices_EQFX) #acciones y divisas
+n_if[2]=ncol(x_bcc) #cetes
+n_if[3]=ncol(X_bm) #bonos m
+n_if[4]=ncol(X_bd_ext) #bonde
+n_if[5]=ncol(X_futtdc) #fut tdc
+n_if[6]=ncol(X_futind) #fut ind
+n_if[7]=ncol(X_sw) #swaps
+n_if[8]=ncol(X_oir) #opciones tasa de interés
+
+#valor del portafolios
+
+V0_port=cbind(V0_acc_div,V0_bcc, V0_bm, V0_bd, V0_fwtdc, V0_fwind, V0_sw, V0_oir) #contrato
+V0T_port=sum(V0_port)
+
+
+
+#INTEGRACIÓN DE TODOS LOS FACTORES DE RIESGO EN UNA MATRIZ
+X_port=cbind(stock_prices_EQFX,x_bcc,X_bm,X_bd_ext,X_futtdc,X_futind,X_sw,X_oir) #Factores de riesgo del portafolios de 8(9) instrumentos financieros
+
+#Cálculo de variaciones Delta_X DEL PORTAFOLIOS
+DeltaX_port=as.matrix(X_port[1:(n-1),]/X_port[2:(n),]-1)
+DeltaX_port[is.nan(DeltaX_port)] <- 0 #quitamos NaN
+DeltaX_port[is.na(DeltaX_port)] <- 0 #quitamos Na
+DeltaX_port[is.infinite(DeltaX_port)] <- 0 #quitamos Na
+
+
+Ns=10000 #Definimos número de simulaciones
+alpha=0.98 #Nivel de Confianza para las medidas de riesgo
+ChCP=0  #0 Cholesky, 1 Componentes Principales
+normempi=1 #0 normal, 1 empírico
+eta=.85 #Varianza explicada  (sólo aplica para Componentes Principales)
+mT=ncol(DeltaX_port)
+
+
+VarDeltaX=if(ChCP==0){cor(DeltaX_port)}else{var(DeltaX_port)*(ncol(DeltaX_port)/(ncol(DeltaX_port)-1))}
+
+if(ChCP==0) {
+  CVarDeltaX=as.matrix(chol(VarDeltaX,pivot=TRUE))
+  CVarDeltaX[is.nan(CVarDeltaX)] <- 0 #quitamos NaN
+  CVarDeltaX[is.na(CVarDeltaX)] <- 0 #quitamos Na
+  print(ncol(CVarDeltaX))
+  print(ncol(VarDeltaX))
+  M=matrix(0, Ns,mT)
+  if(normempi==1)
+  {
+    for (i in 1:mT)
+    {
+      M[,i]=quantile(DeltaX_port[,i],runif(Ns))
+    }
+    Met='Cholesky Empírico'
+  } else	{
+    for (i in 1:mT)
+    {
+      M[,i]=rnorm(Ns)*sd(DeltaX_port[,i])*(mT/(mT-1))+mean(DeltaX_port[,i])
+    }
+    Met='Cholesky Normal'
+  }
+  DeltaX_s=M%*%CVarDeltaX  #Factores de riesgo simulados
+} else { #componentes principales
+  G<-eigen(VarDeltaX)      #eigenvectores
+  g1<-G$values                  #eigenvalores
+  g1p=g1/sum(g1)
+  
+  g1pac=cumsum(g1p) #suma acumulada de varianza
+  
+  k=which.max(g1pac>eta) #valor mínimo k
+  
+  y=as.matrix((DeltaX_port-colMeans(DeltaX_port)))%*%G$vectors[,1:k] #componentes principales
+  #/sqrt(diag(var(DeltaX))))
+  M=matrix(0, Ns,k)
+  if(normempi==0)
+  {
+    for (i in 1:k)
+    {
+      M[,i]=rnorm(Ns)*sd(y[,i])+mean(y[,i])
+    }
+    Met='Componentes Principales Normales'
+  } else	{
+    for (i in 1:k)
+    {
+      M[,i]=quantile(y[,i],runif(Ns))
+    }
+    Met='Componentes Principales Empíricos'
+  }
+  DeltaX_s=M%*% t(G$vectors[,1:k]) #Factores de riesgo simulados
+}
+#Met
+#DeltaX_port[1:5,]
+
+
+#Met
+
+
+Ms1='Se explica el' 
+Ms2= 'de varianza'
+Ms3= 'de suma de var-cov'
+
+Ms1
+print(sum(diag(var(DeltaX_s)))/sum(diag(var(DeltaX_port)))) #Comprobación de matriz de varianza-cov vs original
+Ms2
+
+Ms1
+print(matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_s)%*%t(matrix(1,1,ncol(DeltaX_s)))/matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_port)%*%t(matrix(1,1,ncol(DeltaX_s)))) #Comprobación de matriz de varianza-cov vs original
+Ms3
+
+print(mT)
+#print(k) #número de variables simuladas
+#print(g1pac)
+```
+
+### Medición del riesgo 
+#### Acciones y divisas
+```{r}
+#Medición de riesgo por instrumento, instrumento-factor de riesgo, instrumento - total
+
+
+#Cálculo de matriz de pérdidas y ganancias Acciones y Divisas
+
+#riesgo del acciones y divisas
+m=n_if[1]   #PASO CLAVE
+X_s_acc_div=matrix(0,Ns,n_if[1]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_acc_div=matrix(0,Ns,m) #valor simulado a nivel contrato de acciones y tdc
+Vfr1_acc_div=matrix(0,Ns,m_fx) #valor simulado a nivel contrato de tdc
+Vfr2_acc_div=matrix(0,Ns,m_acc) #valor simulado a nivel contrato de acciones
+PG_acc_div=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_acc_div=matrix(0,Ns,m_fx) 
+PGfr2_acc_div=matrix(0,Ns,m_acc)
+PGT_acc_div=matrix(0,Ns,1) #TOTAL ACC Y DIV
+PGfr1T_acc_div=matrix(0,Ns,1) #total factor riesgo divisas
+PGfr2T_acc_div=matrix(0,Ns,1) #total factor riesgo acciones
+
+DeltaX_s_acc_div=DeltaX_s[,(1:n_if[1])]    #PASO CLAVE
+x0_acc_div=stock_prices_EQFX[1,]   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_acc_div[i,]=as.matrix(x0_acc_div*(1+DeltaX_s_acc_div[i,]))
+  #PASO CLAVE
+  V_acc_div[i,]=cbind(t(pos_fx),t(pos_eq))*X_s_acc_div[i,]
+  #PASO CLAVE
+  Vfr1_acc_div[i,]=t(pos_fx)*X_s_acc_div[i,1:m_fx]
+  #PASO CLAVE
+  Vfr2_acc_div[i,]=t(pos_eq)*X_s_acc_div[i,(m_fx+1):(m_fx+m_acc)]
+  #PASO CLAVE
+  PG_acc_div[i,]=as.matrix(V_acc_div[i,]-V0_acc_div)
+  PGfr1_acc_div[i,]=as.matrix(Vfr1_acc_div[i,]-V0_acc_div[,1:m_fx])
+  PGfr2_acc_div[i,]=as.matrix(Vfr2_acc_div[i,]-V0_acc_div[,(m_fx+1):(m_fx+m_acc)])
+  PGT_acc_div[i,]=sum(PG_acc_div[i,])
+  PGfr1T_acc_div[i,]=sum(PGfr1_acc_div[i,])
+  PGfr2T_acc_div[i,]=sum(PGfr2_acc_div[i,])
+}
+
+print(V_acc_div[1:3,])
+print(Vfr1_acc_div[1:3,])
+print(Vfr2_acc_div[1:3,])
+
+
+PG_acc_div[1:5,]
+PGfr1_acc_div[1:5,]
+PGfr2_acc_div[1:5,]
+PGT_acc_div[1:5,]
+
+
+#VaR por posición
+VaRCont_acc_div=matrix(0,1,m)
+VaRfr1_acc_div=matrix(0,1,m_fx)
+VaRfr2_acc_div=matrix(0,1,m_acc)
+CVaRCont_acc_div=matrix(0,1,m)
+CVaRfr1_acc_div=matrix(0,1,m_fx)
+CVaRfr2_acc_div=matrix(0,1,m_acc)
+for (i in (1:m))
+{
+  VaRCont_acc_div[i]=quantile(PG_acc_div[,i],1-alpha,Ns)
+  CVaRCont_acc_div[i]= mean(merge(which(PG_acc_div[,i]<VaRCont_acc_div[i]),cbind(seq(1,Ns),PG_acc_div[,i]), by.x=1,by.y=1)[,2])
+  if (i<=m_fx)
+  {
+  VaRfr1_acc_div[i]=quantile(PGfr1_acc_div[,i],1-alpha,Ns)
+  CVaRfr1_acc_div[i]= mean(merge(which(PGfr1_acc_div[,i]<VaRfr1_acc_div[i]),cbind(seq(1,Ns),PGfr1_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+  if (i<=m_acc)
+  {  
+  VaRfr2_acc_div[i]=quantile(PGfr2_acc_div[,i],1-alpha,Ns)
+  CVaRfr2_acc_div[i]= mean(merge(which(PGfr2_acc_div[,i]<VaRfr2_acc_div[i]),cbind(seq(1,Ns),PGfr2_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+}
+#Met
+#VaRCont_acc_div
+#VaRfr1_acc_div
+#VaRfr2_acc_div
+#CVaRCont_acc_div
+#CVaRfr1_acc_div
+#CVaRfr2_acc_div
+
+
+#VaR Total
+#Met
+VaRTotal_acc_div=quantile(PGT_acc_div,1-alpha,Ns)
+CVaRTotal_acc_div= mean(merge(which(PGT_acc_div<VaRTotal_acc_div),cbind(seq(1,Ns),PGT_acc_div), by.x=1,by.y=1)[,2])
+VaRTotalfr1_acc_div=quantile(PGfr1T_acc_div,1-alpha,Ns)
+CVaRTotalfr1_acc_div= mean(PGfr1T_acc_div[which(PGfr1T_acc_div<VaRTotalfr1_acc_div),])
+VaRTotalfr2_acc_div=quantile(PGfr2T_acc_div,1-alpha,Ns)
+CVaRTotalfr2_acc_div= mean(PGfr2T_acc_div[which(PGfr2T_acc_div<VaRTotalfr2_acc_div),])
+
+#print("Var Empírico")
+#print(cbind(VaRTotal_acc_div,sum(V0_acc_div), VaRCont_acc_div, V0_acc_div))
+#print("CVar Empírico")
+#print(cbind(CVaRTotal_acc_div,sum(V0_acc_div), CVaRCont_acc_div, V0_acc_div))
+#print("Var Normal")
+#print(cbind(VaRTotal_acc_div,VaRTotalfr1_acc_div,,VaRTotalfr2_acc_div))
+#print("CVar Normal")
+#print(cbind(CVaRTotal_acc_div,CVaRTotalfr1_acc_div,CVaRTotalfr2_acc_div))
+#print(sum(V0_acc_div))
+titles<-c('EURUSD.X', 'GBPUSD.X', 'USDMXN.X', 'AMXL.MX', 'GCARSOA1.MX',  'WALMEX.MX')
+```
+
+```{r}
+print("Var Empírico")
+print('Var total')
+print(VaRTotal_acc_div)
+print('Var por posición')
+print(cbind(titles,t(VaRCont_acc_div)))
+print('Var del contrato acciones')
+print(VaRTotalfr2_acc_div)
+print('Var del contrato divisas')
+print(VaRTotalfr1_acc_div)
+```
+
+```{r}
+print("CVar Empírico")
+print('CVar total')
+print(CVaRTotal_acc_div)
+print('CVar por posición')
+print(cbind(titles,t(CVaRCont_acc_div)))
+print('CVar del contrato acciones')
+print(CVaRTotalfr2_acc_div)
+print('CVar del contrato divisas')
+print(CVaRTotalfr1_acc_div)
+```
+
+### Bonos
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias BONDES
+#dimensión
+m=count(N_bd)    #PASO CLAVE
+X_s_bd=matrix(0,Ns,n_if[4]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_bd=matrix(0,Ns,m)
+Vfr1_bd=matrix(0,Ns,m)
+Vfr2_bd=matrix(0,Ns,m)
+Vfr3_bd=matrix(0,Ns,m)
+PG_bd=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_bd=matrix(0,Ns,m)
+PGfr2_bd=matrix(0,Ns,m)
+PGfr3_bd=matrix(0,Ns,m)
+PGT_bd=matrix(0,Ns,1)
+PGfr1T_bd=matrix(0,Ns,1)
+PGfr2T_bd=matrix(0,Ns,1)
+PGfr3T_bd=matrix(0,Ns,1)
+
+DeltaX_s_bd=DeltaX_s[,sum(n_if[1:3],1):sum(n_if[1:4])]    #PASO CLAVE
+x0_bd=X_bd_ext[1,]    #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_bd[i,]=x0_bd*(1+DeltaX_s_bd[i,])
+  #PASO CLAVE
+  V_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr1_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr2_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr3_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  PG_bd[i,]=V_bd[i,]-V0_bd
+  PGfr1_bd[i,]=Vfr1_bd[i,]-V0_bd
+  PGfr2_bd[i,]=Vfr2_bd[i,]-V0_bd
+  PGfr3_bd[i,]=Vfr3_bd[i,]-V0_bd
+  PGT_bd[i,]=sum(PG_bd[i,])
+  PGfr1T_bd[i,]=sum(PGfr1_bd[i,])
+  PGfr2T_bd[i,]=sum(PGfr2_bd[i,])
+  PGfr3T_bd[i,]=sum(PGfr3_bd[i,])
+}
+
+
+
+PG_bd[1:5,]
+PGfr1_bd[1:5,]
+PGfr2_bd[1:5,]
+PGT_bd[1:5,]
+
+
+#VaR por posición
+VaRCont_bd=matrix(0,1,m)
+VaRfr1_bd=matrix(0,1,m)
+VaRfr2_bd=matrix(0,1,m)
+VaRfr3_bd=matrix(0,1,m)
+CVaRCont_bd=matrix(0,1,m)
+CVaRfr1_bd=matrix(0,1,m)
+CVaRfr2_bd=matrix(0,1,m)
+CVaRfr3_bd=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_bd[i]=quantile(PG_bd[,i],1-alpha,Ns)
+  VaRfr1_bd[i]=quantile(PGfr1_bd[,i],1-alpha,Ns)
+  VaRfr2_bd[i]=quantile(PGfr2_bd[,i],1-alpha,Ns)
+  VaRfr3_bd[i]=quantile(PGfr3_bd[,i],1-alpha,Ns)
+  CVaRfr1_bd[i]= mean(merge(which(PGfr1_bd[,i]<VaRfr1_bd[i]),cbind(seq(1,Ns),PGfr1_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_bd[i]= mean(merge(which(PGfr2_bd[,i]<VaRfr2_bd[i]),cbind(seq(1,Ns),PGfr2_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_bd[i]= mean(merge(which(PGfr3_bd[,i]<VaRfr3_bd[i]),cbind(seq(1,Ns),PGfr3_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_bd[i]= mean(merge(which(PG_bd[,i]<VaRCont_bd[i]),cbind(seq(1,Ns),PG_bd[,i]), by.x=1,by.y=1)[,2])
+}
+Met
+VaRCont_bd
+VaRfr1_bd
+VaRfr2_bd
+CVaRCont_bd
+CVaRfr1_bd
+CVaRfr2_bd
+
+
+#VaR Total
+#Met
+VaRTotal_bd=quantile(PGT_bd,1-alpha,Ns)
+CVaRTotal_bd= mean(merge(which(PGT_bd<VaRTotal_bd),cbind(seq(1,Ns),PGT_bd), by.x=1,by.y=1)[,2])
+VaRTotalfr1_bd=quantile(PGfr1T_bd,1-alpha,Ns)
+CVaRTotalfr1_bd= mean(PGfr1T_bd[which(PGfr1T_bd<VaRTotalfr1_bd),])
+VaRTotalfr2_bd=quantile(PGfr2T_bd,1-alpha,Ns)
+CVaRTotalfr2_bd= mean(PGfr2T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+VaRTotalfr3_bd=quantile(PGfr3T_bd,1-alpha,Ns)
+CVaRTotalfr3_bd= mean(PGfr3T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+
+
+#cbind(VaRTotal_bd,sum(V0_bd), VaRCont_bd, V0_bd)
+#cbind(CVaRTotal_bd,sum(V0_bd), CVaRCont_bd, V0_bd)
+#cbind(VaRTotal_bd,VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd)
+#cbind(CVaRTotal_bd,CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd)
+lista<-c('Tasa descuento','tasa fondeo', 'sobretasa')
+```
+
+```{r}
+print('Var total')
+print(VaRTotal_bd)
+print('Var por factor de riesgo')
+print(rbind(lista,t(c(VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd))))
+
+```
+```{r}
+print('CVar total')
+print(CVaRTotal_bd)
+print('CVar por factor de riesgo')
+print(rbind(lista,t(c(CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd))))
+
+```
+
+### Forwards de Divisas
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS TDC
+#dimensión
+m=ncol(plazos_fwd)  #PASO CLAVE
+X_s_fwtdc=matrix(0,Ns,n_if[5]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwtdc=matrix(0,Ns,m)
+Vfr1_fwtdc=matrix(0,Ns,m)
+Vfr2_fwtdc=matrix(0,Ns,m)
+Vfr3_fwtdc=matrix(0,Ns,m)
+PG_fwtdc=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwtdc=matrix(0,Ns,m)
+PGfr2_fwtdc=matrix(0,Ns,m)
+PGfr3_fwtdc=matrix(0,Ns,m)
+PGT_fwtdc=matrix(0,Ns,1)
+PGfr1T_fwtdc=matrix(0,Ns,1)
+PGfr2T_fwtdc=matrix(0,Ns,1)
+PGfr3T_fwtdc=matrix(0,Ns,1)
+
+DeltaX_s_fwtdc=DeltaX_s[,sum(n_if[1:4],1):sum(n_if[1:5])]  #PASO CLAVE
+x0_fwtdc=X_futtdc[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_fwtdc[i,]=x0_fwtdc*(1+DeltaX_s_fwtdc[i,])
+  #PASO CLAVE
+  V_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd     
+  #PASO CLAVE
+  Vfr1_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr2_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr3_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  PG_fwtdc[i,]=V_fwtdc[i,]-V0_fwtdc
+  PGfr1_fwtdc[i,]=Vfr1_fwtdc[i,]-V0_fwtdc
+  PGfr2_fwtdc[i,]=Vfr2_fwtdc[i,]-V0_fwtdc
+  PGfr3_fwtdc[i,]=Vfr3_fwtdc[i,]-V0_fwtdc
+  PGT_fwtdc[i,]=sum(PG_fwtdc[i,])
+  PGfr1T_fwtdc[i,]=sum(PGfr1_fwtdc[i,])
+  PGfr2T_fwtdc[i,]=sum(PGfr2_fwtdc[i,])
+  PGfr3T_fwtdc[i,]=sum(PGfr3_fwtdc[i,])
+}
+
+
+
+PG_fwtdc[1:5,]
+PGfr1_fwtdc[1:5,]
+PGfr2_fwtdc[1:5,]
+PGT_fwtdc[1:5,]
+
+
+#VaR por posición
+VaRCont_fwtdc=matrix(0,1,m)
+VaRfr1_fwtdc=matrix(0,1,m)
+VaRfr2_fwtdc=matrix(0,1,m)
+VaRfr3_fwtdc=matrix(0,1,m)
+CVaRCont_fwtdc=matrix(0,1,m)
+CVaRfr1_fwtdc=matrix(0,1,m)
+CVaRfr2_fwtdc=matrix(0,1,m)
+CVaRfr3_fwtdc=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwtdc[i]=quantile(PG_fwtdc[,i],1-alpha,Ns)
+  VaRfr1_fwtdc[i]=quantile(PGfr1_fwtdc[,i],1-alpha,Ns)
+  VaRfr2_fwtdc[i]=quantile(PGfr2_fwtdc[,i],1-alpha,Ns)
+  VaRfr3_fwtdc[i]=quantile(PGfr3_fwtdc[,i],1-alpha,Ns)
+  CVaRfr1_fwtdc[i]= mean(merge(which(PGfr1_fwtdc[,i]<VaRfr1_fwtdc[i]),cbind(seq(1,Ns),PGfr1_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwtdc[i]= mean(merge(which(PGfr2_fwtdc[,i]<VaRfr2_fwtdc[i]),cbind(seq(1,Ns),PGfr2_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwtdc[i]= mean(merge(which(PGfr3_fwtdc[,i]<VaRfr3_fwtdc[i]),cbind(seq(1,Ns),PGfr3_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwtdc[i]= mean(merge(which(PG_fwtdc[,i]<VaRCont_fwtdc[i]),cbind(seq(1,Ns),PG_fwtdc[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwtdc
+#VaRfr1_fwtdc
+#VaRfr2_fwtdc
+#CVaRCont_fwtdc
+#CVaRfr1_fwtdc
+#CVaRfr2_fwtdc
+
+
+#VaR Total
+Met
+VaRTotal_fwtdc=quantile(PGT_fwtdc,1-alpha,Ns)
+CVaRTotal_fwtdc= mean(merge(which(PGT_fwtdc<VaRTotal_fwtdc),cbind(seq(1,Ns),PGT_fwtdc), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwtdc=quantile(PGfr1T_fwtdc,1-alpha,Ns)
+CVaRTotalfr1_fwtdc= mean(PGfr1T_fwtdc[which(PGfr1T_fwtdc<VaRTotalfr1_fwtdc),])
+VaRTotalfr2_fwtdc=quantile(PGfr2T_fwtdc,1-alpha,Ns)
+CVaRTotalfr2_fwtdc= mean(PGfr2T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+VaRTotalfr3_fwtdc=quantile(PGfr3T_fwtdc,1-alpha,Ns)
+CVaRTotalfr3_fwtdc= mean(PGfr3T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+
+
+#cbind(VaRTotal_fwtdc,sum(V0_fwtdc), VaRCont_fwtdc, V0_fwtdc)
+#cbind(CVaRTotal_fwtdc,sum(V0_fwtdc), CVaRCont_fwtdc, V0_fwtdc)
+cbind(VaRTotal_fwtdc,VaRTotalfr1_fwtdc,VaRTotalfr2_fwtdc,VaRTotalfr3_fwtdc)
+cbind(CVaRTotal_fwtdc,CVaRTotalfr1_fwtdc,CVaRTotalfr2_fwtdc,CVaRTotalfr3_fwtdc)
+```
+
+### Forwards IPC
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS IPC
+m=ncol(plazos_fwd_ind)  #PASO CLAVE
+X_s_fwind=matrix(0,Ns,n_if[6]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwind=matrix(0,Ns,m)
+Vfr1_fwind=matrix(0,Ns,m)
+Vfr2_fwind=matrix(0,Ns,m)
+Vfr3_fwind=matrix(0,Ns,m)
+PG_fwind=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwind=matrix(0,Ns,m)
+PGfr2_fwind=matrix(0,Ns,m)
+PGfr3_fwind=matrix(0,Ns,m)
+PGT_fwind=matrix(0,Ns,1)
+PGfr1T_fwind=matrix(0,Ns,1)
+PGfr2T_fwind=matrix(0,Ns,1)
+PGfr3T_fwind=matrix(0,Ns,1)
+
+DeltaX_s_fwind=DeltaX_s[,sum(n_if[1:5],1):sum(n_if[1:6])]  #PASO CLAVE
+x0_fwind=X_futind[1,] #PASO CLAVE
+
+
+for (i in 1:Ns)
+{
+  X_s_fwind[i,]=x0_fwind*(1+DeltaX_s_fwind[i,])
+  #PASO CLAVE
+  V_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind     
+  Vfr1_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr2_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr3_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  PG_fwind[i,]=V_fwind[i,]-V0_fwind
+  PGfr1_fwind[i,]=Vfr1_fwind[i,]-V0_fwind
+  PGfr2_fwind[i,]=Vfr2_fwind[i,]-V0_fwind
+  PGfr3_fwind[i,]=Vfr3_fwind[i,]-V0_fwind
+  PGT_fwind[i,]=sum(PG_fwind[i,])
+  PGfr1T_fwind[i,]=sum(PGfr1_fwind[i,])
+  PGfr2T_fwind[i,]=sum(PGfr2_fwind[i,])
+  PGfr3T_fwind[i,]=sum(PGfr3_fwind[i,])
+}
+
+
+PG_fwind[1:5,]
+#PGfr1_fwind[1:5,]
+#PGfr2_fwind[1:5,]
+#PGT_fwind[1:5,]
+
+
+
+#VaR por posición
+VaRCont_fwind=matrix(0,1,m)
+VaRfr1_fwind=matrix(0,1,m)
+VaRfr2_fwind=matrix(0,1,m)
+VaRfr3_fwind=matrix(0,1,m)
+CVaRCont_fwind=matrix(0,1,m)
+CVaRfr1_fwind=matrix(0,1,m)
+CVaRfr2_fwind=matrix(0,1,m)
+CVaRfr3_fwind=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwind[i]=quantile(PG_fwind[,i],1-alpha,Ns)
+  VaRfr1_fwind[i]=quantile(PGfr1_fwind[,i],1-alpha,Ns)
+  VaRfr2_fwind[i]=quantile(PGfr2_fwind[,i],1-alpha,Ns)
+  VaRfr3_fwind[i]=quantile(PGfr3_fwind[,i],1-alpha,Ns)
+  CVaRfr1_fwind[i]= mean(merge(which(PGfr1_fwind[,i]<VaRfr1_fwind[i]),cbind(seq(1,Ns),PGfr1_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwind[i]= mean(merge(which(PGfr2_fwind[,i]<VaRfr2_fwind[i]),cbind(seq(1,Ns),PGfr2_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwind[i]= mean(merge(which(PGfr3_fwind[,i]<VaRfr3_fwind[i]),cbind(seq(1,Ns),PGfr3_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwind[i]= mean(merge(which(PG_fwind[,i]<VaRCont_fwind[i]),cbind(seq(1,Ns),PG_fwind[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwind
+#VaRfr1_fwind
+#VaRfr2_fwind
+#CVaRCont_fwind
+#CVaRfr1_fwind
+#CVaRfr2_fwind
+
+
+#VaR Total
+Met
+VaRTotal_fwind=quantile(PGT_fwind,1-alpha,Ns)
+CVaRTotal_fwind= mean(merge(which(PGT_fwind<VaRTotal_fwind),cbind(seq(1,Ns),PGT_fwind), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwind=quantile(PGfr1T_fwind,1-alpha,Ns)
+CVaRTotalfr1_fwind= mean(PGfr1T_fwind[which(PGfr1T_fwind<VaRTotalfr1_fwind),])
+VaRTotalfr2_fwind=quantile(PGfr2T_fwind,1-alpha,Ns)
+CVaRTotalfr2_fwind= mean(PGfr2T_fwind[which(PGfr2T_fwind<VaRTotalfr2_fwind),])
+VaRTotalfr3_fwind=quantile(PGfr3T_fwind,1-alpha,Ns)
+CVaRTotalfr3_fwind= mean(PGfr3T_fwind[which(PGfr3T_fwind<VaRTotalfr3_fwind),])
+
+
+#print(cbind(VaRTotal_fwind,sum(V0_fwind), VaRCont_fwind, V0_fwind))
+#print(cbind(CVaRTotal_fwind,sum(V0_fwind), CVaRCont_fwind, V0_fwind))
+print(cbind(VaRTotal_fwind,VaRTotalfr1_fwind,VaRTotalfr2_fwind,VaRTotalfr3_fwind))
+cbind(CVaRTotal_fwind,CVaRTotalfr1_fwind,CVaRTotalfr2_fwind,CVaRTotalfr3_fwind)
+
+
+```
+### Swaps
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias SWAP
+
+#riesgo del swap
+m=ncol(N)    #PASO CLAVE
+X_s_sw=matrix(0,Ns,n_if[7]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_sw=matrix(0,Ns,m)
+Vfr1_sw=matrix(0,Ns,m)
+Vfr2_sw=matrix(0,Ns,m)
+PG_sw=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_sw=matrix(0,Ns,m)
+PGfr2_sw=matrix(0,Ns,m)
+PGT_sw=matrix(0,Ns,1)
+PGfr1T_sw=matrix(0,Ns,1)
+PGfr2T_sw=matrix(0,Ns,1)
+
+DeltaX_s_sw=DeltaX_s[,sum(n_if[1:6],1):sum(n_if[1:7])]    #PASO CLAVE
+x0_sw=as.numeric(c(XtfwdT[1,],Xvp[1,]))   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_sw[i,]=x0_sw*(1+DeltaX_s_sw[i,])
+  #PASO CLAVE
+  V_sw[i,]=swap(por_swT, contratos_swT, nominal_swT, X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  Vfr1_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, Xvp[1,],N)
+  #PASO CLAVE
+  Vfr2_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,  XtfwdT[1,], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  PG_sw[i,]=V_sw[i,]-V0_sw
+  PGfr1_sw[i,]=Vfr1_sw[i,]-V0_sw
+  PGfr2_sw[i,]=Vfr2_sw[i,]-V0_sw
+  PGT_sw[i,]=sum(PG_sw[i,])
+  PGfr1T_sw[i,]=sum(PGfr1_sw[i,])
+  PGfr2T_sw[i,]=sum(PGfr2_sw[i,])
+}
+
+
+
+PG_sw[1:5,]
+PGfr1_sw[1:5,]
+PGfr2_sw[1:5,]
+PGT_sw[1:5,]
+
+
+#VaR por posición
+VaRCont_sw=matrix(0,1,m)
+VaRfr1_sw=matrix(0,1,m)
+VaRfr2_sw=matrix(0,1,m)
+CVaRCont_sw=matrix(0,1,m)
+CVaRfr1_sw=matrix(0,1,m)
+CVaRfr2_sw=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_sw[i]=quantile(PG_sw[,i],1-alpha,Ns)
+  VaRfr1_sw[i]=quantile(PGfr1_sw[,i],1-alpha,Ns)
+  VaRfr2_sw[i]=quantile(PGfr2_sw[,i],1-alpha,Ns)
+  CVaRfr1_sw[i]= mean(merge(which(PGfr1_sw[,i]<VaRfr1_sw[i]),cbind(seq(1,Ns),PGfr1_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_sw[i]= mean(merge(which(PGfr2_sw[,i]<VaRfr2_sw[i]),cbind(seq(1,Ns),PGfr2_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_sw[i]= mean(merge(which(PG_sw[,i]<VaRCont_sw[i]),cbind(seq(1,Ns),PG_sw[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_sw
+#VaRfr1_sw
+#VaRfr2_sw
+#CVaRCont_sw
+#CVaRfr1_sw
+#CVaRfr2_sw
+
+
+#VaR Total
+Met
+VaRTotal_sw=quantile(PGT_sw,1-alpha,Ns)
+CVaRTotal_sw= mean(merge(which(PGT_sw<VaRTotal_sw),cbind(seq(1,Ns),PGT_sw), by.x=1,by.y=1)[,2])
+VaRTotalfr1_sw=quantile(PGfr1T_sw,1-alpha,Ns)
+CVaRTotalfr1_sw= mean(PGfr1T_sw[which(PGfr1T_sw<VaRTotalfr1_sw),])
+VaRTotalfr2_sw=quantile(PGfr2T_sw,1-alpha,Ns)
+CVaRTotalfr2_sw= mean(PGfr2T_sw[which(PGfr2T_sw<VaRTotalfr2_sw),])
+
+
+cbind(VaRTotal_sw, VaRCont_sw)
+cbind(CVaRTotal_sw, CVaRCont_sw)
+cbind(VaRTotal_sw,VaRTotalfr1_sw,VaRTotalfr2_sw)
+cbind(CVaRTotal_sw,CVaRTotalfr1_sw,CVaRTotalfr2_sw)
+
+```
+
+### Opciones de tasa de interés
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias Opciones Tasa de interés
+#dimensión
+m=ncol(plazos_oir)  #PASO CLAVE
+X_s_oir=matrix(0,Ns,n_if[8]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_oir=matrix(0,Ns,m)
+Vfr1_oir=matrix(0,Ns,m)
+Vfr2_oir=matrix(0,Ns,m)
+Vfr3_oir=matrix(0,Ns,m)
+PG_oir=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_oir=matrix(0,Ns,m)
+PGfr2_oir=matrix(0,Ns,m)
+PGfr3_oir=matrix(0,Ns,m)
+PGT_oir=matrix(0,Ns,1)
+PGfr1T_oir=matrix(0,Ns,1)
+PGfr2T_oir=matrix(0,Ns,1)
+PGfr3T_oir=matrix(0,Ns,1)
+
+DeltaX_s_oir=DeltaX_s[,sum(n_if[1:7],1):sum(n_if[1:8])]  #PASO CLAVE
+x0_oir=X_oir[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_oir[i,]=x0_oir*(1+DeltaX_s_oir[i,])
+  #PASO CLAVE
+  V_oir[i,]=  opctint(X_s_oir[i,(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr1_oir[i,]=opctint(X_s_oir[i,(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr2_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr3_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  PG_oir[i,]=V_oir[i,]-V0_oir
+  PGfr1_oir[i,]=Vfr1_oir[i,]-V0_oir
+  PGfr2_oir[i,]=Vfr2_oir[i,]-V0_oir
+  PGfr3_oir[i,]=Vfr3_oir[i,]-V0_oir
+  PGT_oir[i,]=sum(PG_oir[i,])
+  PGfr1T_oir[i,]=sum(PGfr1_oir[i,])
+  PGfr2T_oir[i,]=sum(PGfr2_oir[i,])
+  PGfr3T_oir[i,]=sum(PGfr3_oir[i,])
+}
+
+
+
+PG_oir[1:5,]
+PGfr1_oir[1:5,]
+PGfr2_oir[1:5,]
+PGT_oir[1:5,]
+
+
+#VaR por posición
+VaRCont_oir=matrix(0,1,m)
+VaRfr1_oir=matrix(0,1,m)
+VaRfr2_oir=matrix(0,1,m)
+VaRfr3_oir=matrix(0,1,m)
+CVaRCont_oir=matrix(0,1,m)
+CVaRfr1_oir=matrix(0,1,m)
+CVaRfr2_oir=matrix(0,1,m)
+CVaRfr3_oir=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_oir[i]=quantile(PG_oir[,i],1-alpha,Ns)
+  VaRfr1_oir[i]=quantile(PGfr1_oir[,i],1-alpha,Ns)
+  VaRfr2_oir[i]=quantile(PGfr2_oir[,i],1-alpha,Ns)
+  VaRfr3_oir[i]=quantile(PGfr3_oir[,i],1-alpha,Ns)
+  CVaRfr1_oir[i]= mean(merge(which(PGfr1_oir[,i]<VaRfr1_oir[i]),cbind(seq(1,Ns),PGfr1_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_oir[i]= mean(merge(which(PGfr2_oir[,i]<VaRfr2_oir[i]),cbind(seq(1,Ns),PGfr2_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_oir[i]= mean(merge(which(PGfr3_oir[,i]<VaRfr3_oir[i]),cbind(seq(1,Ns),PGfr3_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_oir[i]= mean(merge(which(PG_oir[,i]<VaRCont_oir[i]),cbind(seq(1,Ns),PG_oir[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_oir
+#VaRfr1_oir
+#VaRfr2_oir
+#CVaRCont_oir
+#CVaRfr1_oir
+#CVaRfr2_oir
+
+
+#VaR Total
+#Met
+VaRTotal_oir=quantile(PGT_oir,1-alpha,Ns)
+CVaRTotal_oir= mean(merge(which(PGT_oir<VaRTotal_oir),cbind(seq(1,Ns),PGT_oir), by.x=1,by.y=1)[,2])
+VaRTotalfr1_oir=quantile(PGfr1T_oir,1-alpha,Ns)
+CVaRTotalfr1_oir= mean(PGfr1T_oir[which(PGfr1T_oir<VaRTotalfr1_oir),])
+VaRTotalfr2_oir=quantile(PGfr2T_oir,1-alpha,Ns)
+CVaRTotalfr2_oir= mean(PGfr2T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+VaRTotalfr3_oir=quantile(PGfr3T_oir,1-alpha,Ns)
+CVaRTotalfr3_oir= mean(PGfr3T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+
+
+cbind(VaRTotal_oir, VaRCont_oir)
+cbind(CVaRTotal_oir, CVaRCont_oir)
+cbind(VaRTotal_oir,VaRTotalfr1_oir,VaRTotalfr2_oir,VaRTotalfr3_oir)
+cbind(CVaRTotal_oir,CVaRTotalfr1_oir,CVaRTotalfr2_oir,CVaRTotalfr3_oir)
+```
+### Riesgo total del portafolio
+```{r}
+#Medición de riesgo por factor de riesgo de todo el portafolios
+#Acciones
+#1. Acciones 
+#2. Forward de IPC
+PGPort_ACC=PGfr2T_acc_div+ PGfr3T_fwind #Pérdidas y ganancias
+VaRPort_ACC=quantile(PGPort_ACC,1-alpha,Ns) #VaR
+CVaRPort_ACC= mean(PGPort_ACC[which(PGPort_ACC<VaRPort_ACC)]) #CVaR
+
+print(VaRPort_ACC)
+print(CVaRPort_ACC)
+
+```
+
+```{r}
+#Tasa de Interés
+#1. Dado que swaps y bondes son de tasa de interés usaremos PGT_bd y PGT_sw
+#2. Para futuros usaremos PGfr1T_fwtdc y PGfr2T_fwtdc
+PGPort_TI=PGT_bd+PGT_sw+PGfr1T_fwtdc+PGfr2T_fwtdc +PGfr2T_fwind+PGfr1T_fwind +PGfr1T_oir +PGfr2T_oir #Pérdidas y ganancias
+VaRPort_TI=quantile(PGPort_TI,1-alpha,Ns) #VaR
+CVaRPort_TI= mean(PGPort_TI[which(PGPort_TI<VaRPort_TI)]) #CVaR
+print(VaRPort_TI)
+print(CVaRPort_TI)
+```
+
+```{r}
+#Tipo de cambio
+#1. Dado que swaps y bondes son de tasa de interés no usamos nada
+#2. Para futuros usamos sólo PGfr3T_fwtdc
+PGPort_TDC=PGfr1T_acc_div+PGfr3T_fwtdc  #Pérdidas y ganancias
+VaRPort_TDC=quantile(PGPort_TDC,1-alpha,Ns) #VaR
+CVaRPort_TDC= mean(PGPort_TDC[which(PGPort_TDC<VaRPort_TDC)]) #CVaR
+print(VaRPort_TDC)
+print(CVaRPort_TDC)
+
+
+```
+
+```{r}
+#Volatilidad
+#1. Sólo aplica la volatilidad de Opciones de tasa de interés
+
+PGPort_VOL=PGfr3T_oir  #Pérdidas y ganancias
+VaRPort_VOL=quantile(PGPort_VOL,1-alpha,Ns) #VaR
+CVaRPort_VOL= mean(PGPort_VOL[which(PGPort_VOL<VaRPort_VOL)]) #CVaR
+
+print(VaRPort_VOL)
+print(CVaRPort_VOL)
+
+```
+
+```{r}
+#Medición de riesgo de todo el portafolios
+#Sumar todos los PGT de todos los instrumentos
+
+PGT_Port=PGPort_ACC+PGPort_TI+PGPort_TDC+PGPort_VOL
+VaRTotal_Port=quantile(PGT_Port,1-alpha,Ns) #VaR
+CVaRTotal_Port= mean(PGT_Port[which(PGT_Port<VaRTotal_Port)]) #CVaR
+print(VaRTotal_Port)
+print(CVaRTotal_Port)
+print(V0T_port)
+```
+### Por Cholesky Normal
+```{r}
+#DIMENSION DE TODOS LOS INSTRUMENTOS
+#Son 8 instrumentos financieros (9 si separamos acciones y divisas)
+n_if=matrix(0,8,1)
+n_if[1]=ncol(stock_prices_EQFX) #acciones y divisas
+n_if[2]=ncol(x_bcc) #cetes
+n_if[3]=ncol(X_bm) #bonos m
+n_if[4]=ncol(X_bd_ext) #bonde
+n_if[5]=ncol(X_futtdc) #fut tdc
+n_if[6]=ncol(X_futind) #fut ind
+n_if[7]=ncol(X_sw) #swaps
+n_if[8]=ncol(X_oir) #opciones tasa de interés
+
+#valor del portafolios
+
+V0_port=cbind(V0_acc_div,V0_bcc, V0_bm, V0_bd, V0_fwtdc, V0_fwind, V0_sw, V0_oir) #contrato
+V0T_port=sum(V0_port)
+
+
+
+#INTEGRACIÓN DE TODOS LOS FACTORES DE RIESGO EN UNA MATRIZ
+X_port=cbind(stock_prices_EQFX,x_bcc,X_bm,X_bd_ext,X_futtdc,X_futind,X_sw,X_oir) #Factores de riesgo del portafolios de 8(9) instrumentos financieros
+
+#Cálculo de variaciones Delta_X DEL PORTAFOLIOS
+DeltaX_port=as.matrix(X_port[1:(n-1),]/X_port[2:(n),]-1)
+DeltaX_port[is.nan(DeltaX_port)] <- 0 #quitamos NaN
+DeltaX_port[is.na(DeltaX_port)] <- 0 #quitamos Na
+DeltaX_port[is.infinite(DeltaX_port)] <- 0 #quitamos Na
+
+
+Ns=10000 #Definimos número de simulaciones
+alpha=0.98 #Nivel de Confianza para las medidas de riesgo
+ChCP=0  #0 Cholesky, 1 Componentes Principales
+normempi=0 #0 normal, 1 empírico
+eta=.85 #Varianza explicada  (sólo aplica para Componentes Principales)
+mT=ncol(DeltaX_port)
+
+
+VarDeltaX=if(ChCP==0){cor(DeltaX_port)}else{var(DeltaX_port)*(ncol(DeltaX_port)/(ncol(DeltaX_port)-1))}
+
+if(ChCP==0) {
+  CVarDeltaX=as.matrix(chol(VarDeltaX,pivot=TRUE))
+  CVarDeltaX[is.nan(CVarDeltaX)] <- 0 #quitamos NaN
+  CVarDeltaX[is.na(CVarDeltaX)] <- 0 #quitamos Na
+  print(ncol(CVarDeltaX))
+  print(ncol(VarDeltaX))
+  M=matrix(0, Ns,mT)
+  if(normempi==1)
+  {
+    for (i in 1:mT)
+    {
+      M[,i]=quantile(DeltaX_port[,i],runif(Ns))
+    }
+    Met='Cholesky Empírico'
+  } else	{
+    for (i in 1:mT)
+    {
+      M[,i]=rnorm(Ns)*sd(DeltaX_port[,i])*(mT/(mT-1))+mean(DeltaX_port[,i])
+    }
+    Met='Cholesky Normal'
+  }
+  DeltaX_s=M%*%CVarDeltaX  #Factores de riesgo simulados
+} else { #componentes principales
+  G<-eigen(VarDeltaX)      #eigenvectores
+  g1<-G$values                  #eigenvalores
+  g1p=g1/sum(g1)
+  
+  g1pac=cumsum(g1p) #suma acumulada de varianza
+  
+  k=which.max(g1pac>eta) #valor mínimo k
+  
+  y=as.matrix((DeltaX_port-colMeans(DeltaX_port)))%*%G$vectors[,1:k] #componentes principales
+  #/sqrt(diag(var(DeltaX))))
+  M=matrix(0, Ns,k)
+  if(normempi==0)
+  {
+    for (i in 1:k)
+    {
+      M[,i]=rnorm(Ns)*sd(y[,i])+mean(y[,i])
+    }
+    Met='Componentes Principales Normales'
+  } else	{
+    for (i in 1:k)
+    {
+      M[,i]=quantile(y[,i],runif(Ns))
+    }
+    Met='Componentes Principales Empíricos'
+  }
+  DeltaX_s=M%*% t(G$vectors[,1:k]) #Factores de riesgo simulados
+}
+#Met
+#DeltaX_port[1:5,]
+
+
+#Met
+
+
+Ms1='Se explica el' 
+Ms2= 'de varianza'
+Ms3= 'de suma de var-cov'
+
+Ms1
+print(sum(diag(var(DeltaX_s)))/sum(diag(var(DeltaX_port)))) #Comprobación de matriz de varianza-cov vs original
+Ms2
+
+Ms1
+print(matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_s)%*%t(matrix(1,1,ncol(DeltaX_s)))/matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_port)%*%t(matrix(1,1,ncol(DeltaX_s)))) #Comprobación de matriz de varianza-cov vs original
+Ms3
+
+print(mT)
+#print(k) #número de variables simuladas
+#print(g1pac)
+```
+
+### Medición del riesgo 
+#### Acciones y divisas
+```{r}
+#Medición de riesgo por instrumento, instrumento-factor de riesgo, instrumento - total
+
+
+#Cálculo de matriz de pérdidas y ganancias Acciones y Divisas
+
+#riesgo del acciones y divisas
+m=n_if[1]   #PASO CLAVE
+X_s_acc_div=matrix(0,Ns,n_if[1]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_acc_div=matrix(0,Ns,m) #valor simulado a nivel contrato de acciones y tdc
+Vfr1_acc_div=matrix(0,Ns,m_fx) #valor simulado a nivel contrato de tdc
+Vfr2_acc_div=matrix(0,Ns,m_acc) #valor simulado a nivel contrato de acciones
+PG_acc_div=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_acc_div=matrix(0,Ns,m_fx) 
+PGfr2_acc_div=matrix(0,Ns,m_acc)
+PGT_acc_div=matrix(0,Ns,1) #TOTAL ACC Y DIV
+PGfr1T_acc_div=matrix(0,Ns,1) #total factor riesgo divisas
+PGfr2T_acc_div=matrix(0,Ns,1) #total factor riesgo acciones
+
+DeltaX_s_acc_div=DeltaX_s[,(1:n_if[1])]    #PASO CLAVE
+x0_acc_div=stock_prices_EQFX[1,]   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_acc_div[i,]=as.matrix(x0_acc_div*(1+DeltaX_s_acc_div[i,]))
+  #PASO CLAVE
+  V_acc_div[i,]=cbind(t(pos_fx),t(pos_eq))*X_s_acc_div[i,]
+  #PASO CLAVE
+  Vfr1_acc_div[i,]=t(pos_fx)*X_s_acc_div[i,1:m_fx]
+  #PASO CLAVE
+  Vfr2_acc_div[i,]=t(pos_eq)*X_s_acc_div[i,(m_fx+1):(m_fx+m_acc)]
+  #PASO CLAVE
+  PG_acc_div[i,]=as.matrix(V_acc_div[i,]-V0_acc_div)
+  PGfr1_acc_div[i,]=as.matrix(Vfr1_acc_div[i,]-V0_acc_div[,1:m_fx])
+  PGfr2_acc_div[i,]=as.matrix(Vfr2_acc_div[i,]-V0_acc_div[,(m_fx+1):(m_fx+m_acc)])
+  PGT_acc_div[i,]=sum(PG_acc_div[i,])
+  PGfr1T_acc_div[i,]=sum(PGfr1_acc_div[i,])
+  PGfr2T_acc_div[i,]=sum(PGfr2_acc_div[i,])
+}
+
+print(V_acc_div[1:3,])
+print(Vfr1_acc_div[1:3,])
+print(Vfr2_acc_div[1:3,])
+
+
+PG_acc_div[1:5,]
+PGfr1_acc_div[1:5,]
+PGfr2_acc_div[1:5,]
+PGT_acc_div[1:5,]
+
+
+#VaR por posición
+VaRCont_acc_div=matrix(0,1,m)
+VaRfr1_acc_div=matrix(0,1,m_fx)
+VaRfr2_acc_div=matrix(0,1,m_acc)
+CVaRCont_acc_div=matrix(0,1,m)
+CVaRfr1_acc_div=matrix(0,1,m_fx)
+CVaRfr2_acc_div=matrix(0,1,m_acc)
+for (i in (1:m))
+{
+  VaRCont_acc_div[i]=quantile(PG_acc_div[,i],1-alpha,Ns)
+  CVaRCont_acc_div[i]= mean(merge(which(PG_acc_div[,i]<VaRCont_acc_div[i]),cbind(seq(1,Ns),PG_acc_div[,i]), by.x=1,by.y=1)[,2])
+  if (i<=m_fx)
+  {
+  VaRfr1_acc_div[i]=quantile(PGfr1_acc_div[,i],1-alpha,Ns)
+  CVaRfr1_acc_div[i]= mean(merge(which(PGfr1_acc_div[,i]<VaRfr1_acc_div[i]),cbind(seq(1,Ns),PGfr1_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+  if (i<=m_acc)
+  {  
+  VaRfr2_acc_div[i]=quantile(PGfr2_acc_div[,i],1-alpha,Ns)
+  CVaRfr2_acc_div[i]= mean(merge(which(PGfr2_acc_div[,i]<VaRfr2_acc_div[i]),cbind(seq(1,Ns),PGfr2_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+}
+#Met
+#VaRCont_acc_div
+#VaRfr1_acc_div
+#VaRfr2_acc_div
+#CVaRCont_acc_div
+#CVaRfr1_acc_div
+#CVaRfr2_acc_div
+
+
+#VaR Total
+#Met
+VaRTotal_acc_div=quantile(PGT_acc_div,1-alpha,Ns)
+CVaRTotal_acc_div= mean(merge(which(PGT_acc_div<VaRTotal_acc_div),cbind(seq(1,Ns),PGT_acc_div), by.x=1,by.y=1)[,2])
+VaRTotalfr1_acc_div=quantile(PGfr1T_acc_div,1-alpha,Ns)
+CVaRTotalfr1_acc_div= mean(PGfr1T_acc_div[which(PGfr1T_acc_div<VaRTotalfr1_acc_div),])
+VaRTotalfr2_acc_div=quantile(PGfr2T_acc_div,1-alpha,Ns)
+CVaRTotalfr2_acc_div= mean(PGfr2T_acc_div[which(PGfr2T_acc_div<VaRTotalfr2_acc_div),])
+
+#print("Var Empírico")
+#print(cbind(VaRTotal_acc_div,sum(V0_acc_div), VaRCont_acc_div, V0_acc_div))
+#print("CVar Empírico")
+#print(cbind(CVaRTotal_acc_div,sum(V0_acc_div), CVaRCont_acc_div, V0_acc_div))
+#print("Var Normal")
+#print(cbind(VaRTotal_acc_div,VaRTotalfr1_acc_div,,VaRTotalfr2_acc_div))
+#print("CVar Normal")
+#print(cbind(CVaRTotal_acc_div,CVaRTotalfr1_acc_div,CVaRTotalfr2_acc_div))
+#print(sum(V0_acc_div))
+titles<-c('EURUSD.X', 'GBPUSD.X', 'USDMXN.X', 'AMXL.MX', 'GCARSOA1.MX',  'WALMEX.MX')
+```
+
+```{r}
+print("Var Normal")
+print('Var total')
+print(VaRTotal_acc_div)
+print('Var por posición')
+print(cbind(titles,t(VaRCont_acc_div)))
+print('Var del contrato acciones')
+print(VaRTotalfr2_acc_div)
+print('Var del contrato divisas')
+print(VaRTotalfr1_acc_div)
+```
+
+```{r}
+print("CVar Empírico")
+print('CVar total')
+print(CVaRTotal_acc_div)
+print('CVar por posición')
+print(cbind(titles,t(CVaRCont_acc_div)))
+print('CVar del contrato acciones')
+print(CVaRTotalfr2_acc_div)
+print('CVar del contrato divisas')
+print(CVaRTotalfr1_acc_div)
+```
+
+### Bonos
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias BONDES
+#dimensión
+m=count(N_bd)    #PASO CLAVE
+X_s_bd=matrix(0,Ns,n_if[4]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_bd=matrix(0,Ns,m)
+Vfr1_bd=matrix(0,Ns,m)
+Vfr2_bd=matrix(0,Ns,m)
+Vfr3_bd=matrix(0,Ns,m)
+PG_bd=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_bd=matrix(0,Ns,m)
+PGfr2_bd=matrix(0,Ns,m)
+PGfr3_bd=matrix(0,Ns,m)
+PGT_bd=matrix(0,Ns,1)
+PGfr1T_bd=matrix(0,Ns,1)
+PGfr2T_bd=matrix(0,Ns,1)
+PGfr3T_bd=matrix(0,Ns,1)
+
+DeltaX_s_bd=DeltaX_s[,sum(n_if[1:3],1):sum(n_if[1:4])]    #PASO CLAVE
+x0_bd=X_bd_ext[1,]    #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_bd[i,]=x0_bd*(1+DeltaX_s_bd[i,])
+  #PASO CLAVE
+  V_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr1_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr2_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr3_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  PG_bd[i,]=V_bd[i,]-V0_bd
+  PGfr1_bd[i,]=Vfr1_bd[i,]-V0_bd
+  PGfr2_bd[i,]=Vfr2_bd[i,]-V0_bd
+  PGfr3_bd[i,]=Vfr3_bd[i,]-V0_bd
+  PGT_bd[i,]=sum(PG_bd[i,])
+  PGfr1T_bd[i,]=sum(PGfr1_bd[i,])
+  PGfr2T_bd[i,]=sum(PGfr2_bd[i,])
+  PGfr3T_bd[i,]=sum(PGfr3_bd[i,])
+}
+
+
+
+PG_bd[1:5,]
+PGfr1_bd[1:5,]
+PGfr2_bd[1:5,]
+PGT_bd[1:5,]
+
+
+#VaR por posición
+VaRCont_bd=matrix(0,1,m)
+VaRfr1_bd=matrix(0,1,m)
+VaRfr2_bd=matrix(0,1,m)
+VaRfr3_bd=matrix(0,1,m)
+CVaRCont_bd=matrix(0,1,m)
+CVaRfr1_bd=matrix(0,1,m)
+CVaRfr2_bd=matrix(0,1,m)
+CVaRfr3_bd=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_bd[i]=quantile(PG_bd[,i],1-alpha,Ns)
+  VaRfr1_bd[i]=quantile(PGfr1_bd[,i],1-alpha,Ns)
+  VaRfr2_bd[i]=quantile(PGfr2_bd[,i],1-alpha,Ns)
+  VaRfr3_bd[i]=quantile(PGfr3_bd[,i],1-alpha,Ns)
+  CVaRfr1_bd[i]= mean(merge(which(PGfr1_bd[,i]<VaRfr1_bd[i]),cbind(seq(1,Ns),PGfr1_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_bd[i]= mean(merge(which(PGfr2_bd[,i]<VaRfr2_bd[i]),cbind(seq(1,Ns),PGfr2_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_bd[i]= mean(merge(which(PGfr3_bd[,i]<VaRfr3_bd[i]),cbind(seq(1,Ns),PGfr3_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_bd[i]= mean(merge(which(PG_bd[,i]<VaRCont_bd[i]),cbind(seq(1,Ns),PG_bd[,i]), by.x=1,by.y=1)[,2])
+}
+Met
+VaRCont_bd
+VaRfr1_bd
+VaRfr2_bd
+CVaRCont_bd
+CVaRfr1_bd
+CVaRfr2_bd
+
+
+#VaR Total
+#Met
+VaRTotal_bd=quantile(PGT_bd,1-alpha,Ns)
+CVaRTotal_bd= mean(merge(which(PGT_bd<VaRTotal_bd),cbind(seq(1,Ns),PGT_bd), by.x=1,by.y=1)[,2])
+VaRTotalfr1_bd=quantile(PGfr1T_bd,1-alpha,Ns)
+CVaRTotalfr1_bd= mean(PGfr1T_bd[which(PGfr1T_bd<VaRTotalfr1_bd),])
+VaRTotalfr2_bd=quantile(PGfr2T_bd,1-alpha,Ns)
+CVaRTotalfr2_bd= mean(PGfr2T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+VaRTotalfr3_bd=quantile(PGfr3T_bd,1-alpha,Ns)
+CVaRTotalfr3_bd= mean(PGfr3T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+
+
+#cbind(VaRTotal_bd,sum(V0_bd), VaRCont_bd, V0_bd)
+#cbind(CVaRTotal_bd,sum(V0_bd), CVaRCont_bd, V0_bd)
+#cbind(VaRTotal_bd,VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd)
+#cbind(CVaRTotal_bd,CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd)
+lista<-c('Tasa descuento','tasa fondeo', 'sobretasa')
+```
+
+```{r}
+print('Var total')
+print(VaRTotal_bd)
+print('Var por factor de riesgo')
+print(rbind(lista,t(c(VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd))))
+
+```
+```{r}
+print('CVar total')
+print(CVaRTotal_bd)
+print('CVar por factor de riesgo')
+print(rbind(lista,t(c(CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd))))
+
+```
+
+### Forwards de Divisas
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS TDC
+#dimensión
+m=ncol(plazos_fwd)  #PASO CLAVE
+X_s_fwtdc=matrix(0,Ns,n_if[5]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwtdc=matrix(0,Ns,m)
+Vfr1_fwtdc=matrix(0,Ns,m)
+Vfr2_fwtdc=matrix(0,Ns,m)
+Vfr3_fwtdc=matrix(0,Ns,m)
+PG_fwtdc=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwtdc=matrix(0,Ns,m)
+PGfr2_fwtdc=matrix(0,Ns,m)
+PGfr3_fwtdc=matrix(0,Ns,m)
+PGT_fwtdc=matrix(0,Ns,1)
+PGfr1T_fwtdc=matrix(0,Ns,1)
+PGfr2T_fwtdc=matrix(0,Ns,1)
+PGfr3T_fwtdc=matrix(0,Ns,1)
+
+DeltaX_s_fwtdc=DeltaX_s[,sum(n_if[1:4],1):sum(n_if[1:5])]  #PASO CLAVE
+x0_fwtdc=X_futtdc[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_fwtdc[i,]=x0_fwtdc*(1+DeltaX_s_fwtdc[i,])
+  #PASO CLAVE
+  V_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd     
+  #PASO CLAVE
+  Vfr1_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr2_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr3_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  PG_fwtdc[i,]=V_fwtdc[i,]-V0_fwtdc
+  PGfr1_fwtdc[i,]=Vfr1_fwtdc[i,]-V0_fwtdc
+  PGfr2_fwtdc[i,]=Vfr2_fwtdc[i,]-V0_fwtdc
+  PGfr3_fwtdc[i,]=Vfr3_fwtdc[i,]-V0_fwtdc
+  PGT_fwtdc[i,]=sum(PG_fwtdc[i,])
+  PGfr1T_fwtdc[i,]=sum(PGfr1_fwtdc[i,])
+  PGfr2T_fwtdc[i,]=sum(PGfr2_fwtdc[i,])
+  PGfr3T_fwtdc[i,]=sum(PGfr3_fwtdc[i,])
+}
+
+
+
+PG_fwtdc[1:5,]
+PGfr1_fwtdc[1:5,]
+PGfr2_fwtdc[1:5,]
+PGT_fwtdc[1:5,]
+
+
+#VaR por posición
+VaRCont_fwtdc=matrix(0,1,m)
+VaRfr1_fwtdc=matrix(0,1,m)
+VaRfr2_fwtdc=matrix(0,1,m)
+VaRfr3_fwtdc=matrix(0,1,m)
+CVaRCont_fwtdc=matrix(0,1,m)
+CVaRfr1_fwtdc=matrix(0,1,m)
+CVaRfr2_fwtdc=matrix(0,1,m)
+CVaRfr3_fwtdc=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwtdc[i]=quantile(PG_fwtdc[,i],1-alpha,Ns)
+  VaRfr1_fwtdc[i]=quantile(PGfr1_fwtdc[,i],1-alpha,Ns)
+  VaRfr2_fwtdc[i]=quantile(PGfr2_fwtdc[,i],1-alpha,Ns)
+  VaRfr3_fwtdc[i]=quantile(PGfr3_fwtdc[,i],1-alpha,Ns)
+  CVaRfr1_fwtdc[i]= mean(merge(which(PGfr1_fwtdc[,i]<VaRfr1_fwtdc[i]),cbind(seq(1,Ns),PGfr1_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwtdc[i]= mean(merge(which(PGfr2_fwtdc[,i]<VaRfr2_fwtdc[i]),cbind(seq(1,Ns),PGfr2_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwtdc[i]= mean(merge(which(PGfr3_fwtdc[,i]<VaRfr3_fwtdc[i]),cbind(seq(1,Ns),PGfr3_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwtdc[i]= mean(merge(which(PG_fwtdc[,i]<VaRCont_fwtdc[i]),cbind(seq(1,Ns),PG_fwtdc[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwtdc
+#VaRfr1_fwtdc
+#VaRfr2_fwtdc
+#CVaRCont_fwtdc
+#CVaRfr1_fwtdc
+#CVaRfr2_fwtdc
+
+
+#VaR Total
+Met
+VaRTotal_fwtdc=quantile(PGT_fwtdc,1-alpha,Ns)
+CVaRTotal_fwtdc= mean(merge(which(PGT_fwtdc<VaRTotal_fwtdc),cbind(seq(1,Ns),PGT_fwtdc), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwtdc=quantile(PGfr1T_fwtdc,1-alpha,Ns)
+CVaRTotalfr1_fwtdc= mean(PGfr1T_fwtdc[which(PGfr1T_fwtdc<VaRTotalfr1_fwtdc),])
+VaRTotalfr2_fwtdc=quantile(PGfr2T_fwtdc,1-alpha,Ns)
+CVaRTotalfr2_fwtdc= mean(PGfr2T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+VaRTotalfr3_fwtdc=quantile(PGfr3T_fwtdc,1-alpha,Ns)
+CVaRTotalfr3_fwtdc= mean(PGfr3T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+
+
+#cbind(VaRTotal_fwtdc,sum(V0_fwtdc), VaRCont_fwtdc, V0_fwtdc)
+#cbind(CVaRTotal_fwtdc,sum(V0_fwtdc), CVaRCont_fwtdc, V0_fwtdc)
+cbind(VaRTotal_fwtdc,VaRTotalfr1_fwtdc,VaRTotalfr2_fwtdc,VaRTotalfr3_fwtdc)
+cbind(CVaRTotal_fwtdc,CVaRTotalfr1_fwtdc,CVaRTotalfr2_fwtdc,CVaRTotalfr3_fwtdc)
+```
+
+### Forwards IPC
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS IPC
+m=ncol(plazos_fwd_ind)  #PASO CLAVE
+X_s_fwind=matrix(0,Ns,n_if[6]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwind=matrix(0,Ns,m)
+Vfr1_fwind=matrix(0,Ns,m)
+Vfr2_fwind=matrix(0,Ns,m)
+Vfr3_fwind=matrix(0,Ns,m)
+PG_fwind=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwind=matrix(0,Ns,m)
+PGfr2_fwind=matrix(0,Ns,m)
+PGfr3_fwind=matrix(0,Ns,m)
+PGT_fwind=matrix(0,Ns,1)
+PGfr1T_fwind=matrix(0,Ns,1)
+PGfr2T_fwind=matrix(0,Ns,1)
+PGfr3T_fwind=matrix(0,Ns,1)
+
+DeltaX_s_fwind=DeltaX_s[,sum(n_if[1:5],1):sum(n_if[1:6])]  #PASO CLAVE
+x0_fwind=X_futind[1,] #PASO CLAVE
+
+
+for (i in 1:Ns)
+{
+  X_s_fwind[i,]=x0_fwind*(1+DeltaX_s_fwind[i,])
+  #PASO CLAVE
+  V_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind     
+  Vfr1_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr2_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr3_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  PG_fwind[i,]=V_fwind[i,]-V0_fwind
+  PGfr1_fwind[i,]=Vfr1_fwind[i,]-V0_fwind
+  PGfr2_fwind[i,]=Vfr2_fwind[i,]-V0_fwind
+  PGfr3_fwind[i,]=Vfr3_fwind[i,]-V0_fwind
+  PGT_fwind[i,]=sum(PG_fwind[i,])
+  PGfr1T_fwind[i,]=sum(PGfr1_fwind[i,])
+  PGfr2T_fwind[i,]=sum(PGfr2_fwind[i,])
+  PGfr3T_fwind[i,]=sum(PGfr3_fwind[i,])
+}
+
+
+PG_fwind[1:5,]
+#PGfr1_fwind[1:5,]
+#PGfr2_fwind[1:5,]
+#PGT_fwind[1:5,]
+
+
+
+#VaR por posición
+VaRCont_fwind=matrix(0,1,m)
+VaRfr1_fwind=matrix(0,1,m)
+VaRfr2_fwind=matrix(0,1,m)
+VaRfr3_fwind=matrix(0,1,m)
+CVaRCont_fwind=matrix(0,1,m)
+CVaRfr1_fwind=matrix(0,1,m)
+CVaRfr2_fwind=matrix(0,1,m)
+CVaRfr3_fwind=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwind[i]=quantile(PG_fwind[,i],1-alpha,Ns)
+  VaRfr1_fwind[i]=quantile(PGfr1_fwind[,i],1-alpha,Ns)
+  VaRfr2_fwind[i]=quantile(PGfr2_fwind[,i],1-alpha,Ns)
+  VaRfr3_fwind[i]=quantile(PGfr3_fwind[,i],1-alpha,Ns)
+  CVaRfr1_fwind[i]= mean(merge(which(PGfr1_fwind[,i]<VaRfr1_fwind[i]),cbind(seq(1,Ns),PGfr1_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwind[i]= mean(merge(which(PGfr2_fwind[,i]<VaRfr2_fwind[i]),cbind(seq(1,Ns),PGfr2_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwind[i]= mean(merge(which(PGfr3_fwind[,i]<VaRfr3_fwind[i]),cbind(seq(1,Ns),PGfr3_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwind[i]= mean(merge(which(PG_fwind[,i]<VaRCont_fwind[i]),cbind(seq(1,Ns),PG_fwind[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwind
+#VaRfr1_fwind
+#VaRfr2_fwind
+#CVaRCont_fwind
+#CVaRfr1_fwind
+#CVaRfr2_fwind
+
+
+#VaR Total
+Met
+VaRTotal_fwind=quantile(PGT_fwind,1-alpha,Ns)
+CVaRTotal_fwind= mean(merge(which(PGT_fwind<VaRTotal_fwind),cbind(seq(1,Ns),PGT_fwind), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwind=quantile(PGfr1T_fwind,1-alpha,Ns)
+CVaRTotalfr1_fwind= mean(PGfr1T_fwind[which(PGfr1T_fwind<VaRTotalfr1_fwind),])
+VaRTotalfr2_fwind=quantile(PGfr2T_fwind,1-alpha,Ns)
+CVaRTotalfr2_fwind= mean(PGfr2T_fwind[which(PGfr2T_fwind<VaRTotalfr2_fwind),])
+VaRTotalfr3_fwind=quantile(PGfr3T_fwind,1-alpha,Ns)
+CVaRTotalfr3_fwind= mean(PGfr3T_fwind[which(PGfr3T_fwind<VaRTotalfr3_fwind),])
+
+
+#print(cbind(VaRTotal_fwind,sum(V0_fwind), VaRCont_fwind, V0_fwind))
+#print(cbind(CVaRTotal_fwind,sum(V0_fwind), CVaRCont_fwind, V0_fwind))
+print(cbind(VaRTotal_fwind,VaRTotalfr1_fwind,VaRTotalfr2_fwind,VaRTotalfr3_fwind))
+cbind(CVaRTotal_fwind,CVaRTotalfr1_fwind,CVaRTotalfr2_fwind,CVaRTotalfr3_fwind)
+
+
+```
+### Swaps
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias SWAP
+
+#riesgo del swap
+m=ncol(N)    #PASO CLAVE
+X_s_sw=matrix(0,Ns,n_if[7]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_sw=matrix(0,Ns,m)
+Vfr1_sw=matrix(0,Ns,m)
+Vfr2_sw=matrix(0,Ns,m)
+PG_sw=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_sw=matrix(0,Ns,m)
+PGfr2_sw=matrix(0,Ns,m)
+PGT_sw=matrix(0,Ns,1)
+PGfr1T_sw=matrix(0,Ns,1)
+PGfr2T_sw=matrix(0,Ns,1)
+
+DeltaX_s_sw=DeltaX_s[,sum(n_if[1:6],1):sum(n_if[1:7])]    #PASO CLAVE
+x0_sw=as.numeric(c(XtfwdT[1,],Xvp[1,]))   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_sw[i,]=x0_sw*(1+DeltaX_s_sw[i,])
+  #PASO CLAVE
+  V_sw[i,]=swap(por_swT, contratos_swT, nominal_swT, X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  Vfr1_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, Xvp[1,],N)
+  #PASO CLAVE
+  Vfr2_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,  XtfwdT[1,], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  PG_sw[i,]=V_sw[i,]-V0_sw
+  PGfr1_sw[i,]=Vfr1_sw[i,]-V0_sw
+  PGfr2_sw[i,]=Vfr2_sw[i,]-V0_sw
+  PGT_sw[i,]=sum(PG_sw[i,])
+  PGfr1T_sw[i,]=sum(PGfr1_sw[i,])
+  PGfr2T_sw[i,]=sum(PGfr2_sw[i,])
+}
+
+
+
+PG_sw[1:5,]
+PGfr1_sw[1:5,]
+PGfr2_sw[1:5,]
+PGT_sw[1:5,]
+
+
+#VaR por posición
+VaRCont_sw=matrix(0,1,m)
+VaRfr1_sw=matrix(0,1,m)
+VaRfr2_sw=matrix(0,1,m)
+CVaRCont_sw=matrix(0,1,m)
+CVaRfr1_sw=matrix(0,1,m)
+CVaRfr2_sw=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_sw[i]=quantile(PG_sw[,i],1-alpha,Ns)
+  VaRfr1_sw[i]=quantile(PGfr1_sw[,i],1-alpha,Ns)
+  VaRfr2_sw[i]=quantile(PGfr2_sw[,i],1-alpha,Ns)
+  CVaRfr1_sw[i]= mean(merge(which(PGfr1_sw[,i]<VaRfr1_sw[i]),cbind(seq(1,Ns),PGfr1_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_sw[i]= mean(merge(which(PGfr2_sw[,i]<VaRfr2_sw[i]),cbind(seq(1,Ns),PGfr2_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_sw[i]= mean(merge(which(PG_sw[,i]<VaRCont_sw[i]),cbind(seq(1,Ns),PG_sw[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_sw
+#VaRfr1_sw
+#VaRfr2_sw
+#CVaRCont_sw
+#CVaRfr1_sw
+#CVaRfr2_sw
+
+
+#VaR Total
+Met
+VaRTotal_sw=quantile(PGT_sw,1-alpha,Ns)
+CVaRTotal_sw= mean(merge(which(PGT_sw<VaRTotal_sw),cbind(seq(1,Ns),PGT_sw), by.x=1,by.y=1)[,2])
+VaRTotalfr1_sw=quantile(PGfr1T_sw,1-alpha,Ns)
+CVaRTotalfr1_sw= mean(PGfr1T_sw[which(PGfr1T_sw<VaRTotalfr1_sw),])
+VaRTotalfr2_sw=quantile(PGfr2T_sw,1-alpha,Ns)
+CVaRTotalfr2_sw= mean(PGfr2T_sw[which(PGfr2T_sw<VaRTotalfr2_sw),])
+
+
+cbind(VaRTotal_sw, VaRCont_sw)
+cbind(CVaRTotal_sw, CVaRCont_sw)
+cbind(VaRTotal_sw,VaRTotalfr1_sw,VaRTotalfr2_sw)
+cbind(CVaRTotal_sw,CVaRTotalfr1_sw,CVaRTotalfr2_sw)
+
+```
+
+### Opciones de tasa de interés
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias Opciones Tasa de interés
+#dimensión
+m=ncol(plazos_oir)  #PASO CLAVE
+X_s_oir=matrix(0,Ns,n_if[8]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_oir=matrix(0,Ns,m)
+Vfr1_oir=matrix(0,Ns,m)
+Vfr2_oir=matrix(0,Ns,m)
+Vfr3_oir=matrix(0,Ns,m)
+PG_oir=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_oir=matrix(0,Ns,m)
+PGfr2_oir=matrix(0,Ns,m)
+PGfr3_oir=matrix(0,Ns,m)
+PGT_oir=matrix(0,Ns,1)
+PGfr1T_oir=matrix(0,Ns,1)
+PGfr2T_oir=matrix(0,Ns,1)
+PGfr3T_oir=matrix(0,Ns,1)
+
+DeltaX_s_oir=DeltaX_s[,sum(n_if[1:7],1):sum(n_if[1:8])]  #PASO CLAVE
+x0_oir=X_oir[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_oir[i,]=x0_oir*(1+DeltaX_s_oir[i,])
+  #PASO CLAVE
+  V_oir[i,]=  opctint(X_s_oir[i,(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr1_oir[i,]=opctint(X_s_oir[i,(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr2_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr3_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  PG_oir[i,]=V_oir[i,]-V0_oir
+  PGfr1_oir[i,]=Vfr1_oir[i,]-V0_oir
+  PGfr2_oir[i,]=Vfr2_oir[i,]-V0_oir
+  PGfr3_oir[i,]=Vfr3_oir[i,]-V0_oir
+  PGT_oir[i,]=sum(PG_oir[i,])
+  PGfr1T_oir[i,]=sum(PGfr1_oir[i,])
+  PGfr2T_oir[i,]=sum(PGfr2_oir[i,])
+  PGfr3T_oir[i,]=sum(PGfr3_oir[i,])
+}
+
+
+
+PG_oir[1:5,]
+PGfr1_oir[1:5,]
+PGfr2_oir[1:5,]
+PGT_oir[1:5,]
+
+
+#VaR por posición
+VaRCont_oir=matrix(0,1,m)
+VaRfr1_oir=matrix(0,1,m)
+VaRfr2_oir=matrix(0,1,m)
+VaRfr3_oir=matrix(0,1,m)
+CVaRCont_oir=matrix(0,1,m)
+CVaRfr1_oir=matrix(0,1,m)
+CVaRfr2_oir=matrix(0,1,m)
+CVaRfr3_oir=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_oir[i]=quantile(PG_oir[,i],1-alpha,Ns)
+  VaRfr1_oir[i]=quantile(PGfr1_oir[,i],1-alpha,Ns)
+  VaRfr2_oir[i]=quantile(PGfr2_oir[,i],1-alpha,Ns)
+  VaRfr3_oir[i]=quantile(PGfr3_oir[,i],1-alpha,Ns)
+  CVaRfr1_oir[i]= mean(merge(which(PGfr1_oir[,i]<VaRfr1_oir[i]),cbind(seq(1,Ns),PGfr1_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_oir[i]= mean(merge(which(PGfr2_oir[,i]<VaRfr2_oir[i]),cbind(seq(1,Ns),PGfr2_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_oir[i]= mean(merge(which(PGfr3_oir[,i]<VaRfr3_oir[i]),cbind(seq(1,Ns),PGfr3_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_oir[i]= mean(merge(which(PG_oir[,i]<VaRCont_oir[i]),cbind(seq(1,Ns),PG_oir[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_oir
+#VaRfr1_oir
+#VaRfr2_oir
+#CVaRCont_oir
+#CVaRfr1_oir
+#CVaRfr2_oir
+
+
+#VaR Total
+#Met
+VaRTotal_oir=quantile(PGT_oir,1-alpha,Ns)
+CVaRTotal_oir= mean(merge(which(PGT_oir<VaRTotal_oir),cbind(seq(1,Ns),PGT_oir), by.x=1,by.y=1)[,2])
+VaRTotalfr1_oir=quantile(PGfr1T_oir,1-alpha,Ns)
+CVaRTotalfr1_oir= mean(PGfr1T_oir[which(PGfr1T_oir<VaRTotalfr1_oir),])
+VaRTotalfr2_oir=quantile(PGfr2T_oir,1-alpha,Ns)
+CVaRTotalfr2_oir= mean(PGfr2T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+VaRTotalfr3_oir=quantile(PGfr3T_oir,1-alpha,Ns)
+CVaRTotalfr3_oir= mean(PGfr3T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+
+
+cbind(VaRTotal_oir, VaRCont_oir)
+cbind(CVaRTotal_oir, CVaRCont_oir)
+cbind(VaRTotal_oir,VaRTotalfr1_oir,VaRTotalfr2_oir,VaRTotalfr3_oir)
+cbind(CVaRTotal_oir,CVaRTotalfr1_oir,CVaRTotalfr2_oir,CVaRTotalfr3_oir)
+```
+### Riesgo total del portafolio
+```{r}
+#Medición de riesgo por factor de riesgo de todo el portafolios
+#Acciones
+#1. Acciones 
+#2. Forward de IPC
+PGPort_ACC=PGfr2T_acc_div+ PGfr3T_fwind #Pérdidas y ganancias
+VaRPort_ACC=quantile(PGPort_ACC,1-alpha,Ns) #VaR
+CVaRPort_ACC= mean(PGPort_ACC[which(PGPort_ACC<VaRPort_ACC)]) #CVaR
+
+print(VaRPort_ACC)
+print(CVaRPort_ACC)
+
+```
+
+```{r}
+#Tasa de Interés
+#1. Dado que swaps y bondes son de tasa de interés usaremos PGT_bd y PGT_sw
+#2. Para futuros usaremos PGfr1T_fwtdc y PGfr2T_fwtdc
+PGPort_TI=PGT_bd+PGT_sw+PGfr1T_fwtdc+PGfr2T_fwtdc +PGfr2T_fwind+PGfr1T_fwind +PGfr1T_oir +PGfr2T_oir #Pérdidas y ganancias
+VaRPort_TI=quantile(PGPort_TI,1-alpha,Ns) #VaR
+CVaRPort_TI= mean(PGPort_TI[which(PGPort_TI<VaRPort_TI)]) #CVaR
+print(VaRPort_TI)
+print(CVaRPort_TI)
+```
+
+```{r}
+#Tipo de cambio
+#1. Dado que swaps y bondes son de tasa de interés no usamos nada
+#2. Para futuros usamos sólo PGfr3T_fwtdc
+PGPort_TDC=PGfr1T_acc_div+PGfr3T_fwtdc  #Pérdidas y ganancias
+VaRPort_TDC=quantile(PGPort_TDC,1-alpha,Ns) #VaR
+CVaRPort_TDC= mean(PGPort_TDC[which(PGPort_TDC<VaRPort_TDC)]) #CVaR
+print(VaRPort_TDC)
+print(CVaRPort_TDC)
+
+
+```
+
+```{r}
+#Volatilidad
+#1. Sólo aplica la volatilidad de Opciones de tasa de interés
+
+PGPort_VOL=PGfr3T_oir  #Pérdidas y ganancias
+VaRPort_VOL=quantile(PGPort_VOL,1-alpha,Ns) #VaR
+CVaRPort_VOL= mean(PGPort_VOL[which(PGPort_VOL<VaRPort_VOL)]) #CVaR
+
+print(VaRPort_VOL)
+print(CVaRPort_VOL)
+
+```
+
+```{r}
+#Medición de riesgo de todo el portafolios
+#Sumar todos los PGT de todos los instrumentos
+
+PGT_Port=PGPort_ACC+PGPort_TI+PGPort_TDC+PGPort_VOL
+VaRTotal_Port=quantile(PGT_Port,1-alpha,Ns) #VaR
+CVaRTotal_Port= mean(PGT_Port[which(PGT_Port<VaRTotal_Port)]) #CVaR
+print(VaRTotal_Port)
+print(CVaRTotal_Port)
+print(V0T_port)
+```
+### Por Compenetes principales empírico
+
+### Por Cholesky Normal
+```{r}
+#DIMENSION DE TODOS LOS INSTRUMENTOS
+#Son 8 instrumentos financieros (9 si separamos acciones y divisas)
+n_if=matrix(0,8,1)
+n_if[1]=ncol(stock_prices_EQFX) #acciones y divisas
+n_if[2]=ncol(x_bcc) #cetes
+n_if[3]=ncol(X_bm) #bonos m
+n_if[4]=ncol(X_bd_ext) #bonde
+n_if[5]=ncol(X_futtdc) #fut tdc
+n_if[6]=ncol(X_futind) #fut ind
+n_if[7]=ncol(X_sw) #swaps
+n_if[8]=ncol(X_oir) #opciones tasa de interés
+
+#valor del portafolios
+
+V0_port=cbind(V0_acc_div,V0_bcc, V0_bm, V0_bd, V0_fwtdc, V0_fwind, V0_sw, V0_oir) #contrato
+V0T_port=sum(V0_port)
+
+
+
+#INTEGRACIÓN DE TODOS LOS FACTORES DE RIESGO EN UNA MATRIZ
+X_port=cbind(stock_prices_EQFX,x_bcc,X_bm,X_bd_ext,X_futtdc,X_futind,X_sw,X_oir) #Factores de riesgo del portafolios de 8(9) instrumentos financieros
+
+#Cálculo de variaciones Delta_X DEL PORTAFOLIOS
+DeltaX_port=as.matrix(X_port[1:(n-1),]/X_port[2:(n),]-1)
+DeltaX_port[is.nan(DeltaX_port)] <- 0 #quitamos NaN
+DeltaX_port[is.na(DeltaX_port)] <- 0 #quitamos Na
+DeltaX_port[is.infinite(DeltaX_port)] <- 0 #quitamos Na
+
+
+Ns=10000 #Definimos número de simulaciones
+alpha=0.98 #Nivel de Confianza para las medidas de riesgo
+ChCP=1  #0 Cholesky, 1 Componentes Principales
+normempi=1 #0 normal, 1 empírico
+eta=.85 #Varianza explicada  (sólo aplica para Componentes Principales)
+mT=ncol(DeltaX_port)
+
+
+VarDeltaX=if(ChCP==0){cor(DeltaX_port)}else{var(DeltaX_port)*(ncol(DeltaX_port)/(ncol(DeltaX_port)-1))}
+
+if(ChCP==0) {
+  CVarDeltaX=as.matrix(chol(VarDeltaX,pivot=TRUE))
+  CVarDeltaX[is.nan(CVarDeltaX)] <- 0 #quitamos NaN
+  CVarDeltaX[is.na(CVarDeltaX)] <- 0 #quitamos Na
+  print(ncol(CVarDeltaX))
+  print(ncol(VarDeltaX))
+  M=matrix(0, Ns,mT)
+  if(normempi==1)
+  {
+    for (i in 1:mT)
+    {
+      M[,i]=quantile(DeltaX_port[,i],runif(Ns))
+    }
+    Met='Cholesky Empírico'
+  } else	{
+    for (i in 1:mT)
+    {
+      M[,i]=rnorm(Ns)*sd(DeltaX_port[,i])*(mT/(mT-1))+mean(DeltaX_port[,i])
+    }
+    Met='Cholesky Normal'
+  }
+  DeltaX_s=M%*%CVarDeltaX  #Factores de riesgo simulados
+} else { #componentes principales
+  G<-eigen(VarDeltaX)      #eigenvectores
+  g1<-G$values                  #eigenvalores
+  g1p=g1/sum(g1)
+  
+  g1pac=cumsum(g1p) #suma acumulada de varianza
+  
+  k=which.max(g1pac>eta) #valor mínimo k
+  
+  y=as.matrix((DeltaX_port-colMeans(DeltaX_port)))%*%G$vectors[,1:k] #componentes principales
+  #/sqrt(diag(var(DeltaX))))
+  M=matrix(0, Ns,k)
+  if(normempi==0)
+  {
+    for (i in 1:k)
+    {
+      M[,i]=rnorm(Ns)*sd(y[,i])+mean(y[,i])
+    }
+    Met='Componentes Principales Normales'
+  } else	{
+    for (i in 1:k)
+    {
+      M[,i]=quantile(y[,i],runif(Ns))
+    }
+    Met='Componentes Principales Empíricos'
+  }
+  DeltaX_s=M%*% t(G$vectors[,1:k]) #Factores de riesgo simulados
+}
+#Met
+#DeltaX_port[1:5,]
+
+
+#Met
+
+
+Ms1='Se explica el' 
+Ms2= 'de varianza'
+Ms3= 'de suma de var-cov'
+
+Ms1
+print(sum(diag(var(DeltaX_s)))/sum(diag(var(DeltaX_port)))) #Comprobación de matriz de varianza-cov vs original
+Ms2
+
+Ms1
+print(matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_s)%*%t(matrix(1,1,ncol(DeltaX_s)))/matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_port)%*%t(matrix(1,1,ncol(DeltaX_s)))) #Comprobación de matriz de varianza-cov vs original
+Ms3
+
+print(mT)
+#print(k) #número de variables simuladas
+#print(g1pac)
+```
+
+### Medición del riesgo 
+#### Acciones y divisas
+```{r}
+#Medición de riesgo por instrumento, instrumento-factor de riesgo, instrumento - total
+
+
+#Cálculo de matriz de pérdidas y ganancias Acciones y Divisas
+
+#riesgo del acciones y divisas
+m=n_if[1]   #PASO CLAVE
+X_s_acc_div=matrix(0,Ns,n_if[1]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_acc_div=matrix(0,Ns,m) #valor simulado a nivel contrato de acciones y tdc
+Vfr1_acc_div=matrix(0,Ns,m_fx) #valor simulado a nivel contrato de tdc
+Vfr2_acc_div=matrix(0,Ns,m_acc) #valor simulado a nivel contrato de acciones
+PG_acc_div=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_acc_div=matrix(0,Ns,m_fx) 
+PGfr2_acc_div=matrix(0,Ns,m_acc)
+PGT_acc_div=matrix(0,Ns,1) #TOTAL ACC Y DIV
+PGfr1T_acc_div=matrix(0,Ns,1) #total factor riesgo divisas
+PGfr2T_acc_div=matrix(0,Ns,1) #total factor riesgo acciones
+
+DeltaX_s_acc_div=DeltaX_s[,(1:n_if[1])]    #PASO CLAVE
+x0_acc_div=stock_prices_EQFX[1,]   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_acc_div[i,]=as.matrix(x0_acc_div*(1+DeltaX_s_acc_div[i,]))
+  #PASO CLAVE
+  V_acc_div[i,]=cbind(t(pos_fx),t(pos_eq))*X_s_acc_div[i,]
+  #PASO CLAVE
+  Vfr1_acc_div[i,]=t(pos_fx)*X_s_acc_div[i,1:m_fx]
+  #PASO CLAVE
+  Vfr2_acc_div[i,]=t(pos_eq)*X_s_acc_div[i,(m_fx+1):(m_fx+m_acc)]
+  #PASO CLAVE
+  PG_acc_div[i,]=as.matrix(V_acc_div[i,]-V0_acc_div)
+  PGfr1_acc_div[i,]=as.matrix(Vfr1_acc_div[i,]-V0_acc_div[,1:m_fx])
+  PGfr2_acc_div[i,]=as.matrix(Vfr2_acc_div[i,]-V0_acc_div[,(m_fx+1):(m_fx+m_acc)])
+  PGT_acc_div[i,]=sum(PG_acc_div[i,])
+  PGfr1T_acc_div[i,]=sum(PGfr1_acc_div[i,])
+  PGfr2T_acc_div[i,]=sum(PGfr2_acc_div[i,])
+}
+
+print(V_acc_div[1:3,])
+print(Vfr1_acc_div[1:3,])
+print(Vfr2_acc_div[1:3,])
+
+
+PG_acc_div[1:5,]
+PGfr1_acc_div[1:5,]
+PGfr2_acc_div[1:5,]
+PGT_acc_div[1:5,]
+
+
+#VaR por posición
+VaRCont_acc_div=matrix(0,1,m)
+VaRfr1_acc_div=matrix(0,1,m_fx)
+VaRfr2_acc_div=matrix(0,1,m_acc)
+CVaRCont_acc_div=matrix(0,1,m)
+CVaRfr1_acc_div=matrix(0,1,m_fx)
+CVaRfr2_acc_div=matrix(0,1,m_acc)
+for (i in (1:m))
+{
+  VaRCont_acc_div[i]=quantile(PG_acc_div[,i],1-alpha,Ns)
+  CVaRCont_acc_div[i]= mean(merge(which(PG_acc_div[,i]<VaRCont_acc_div[i]),cbind(seq(1,Ns),PG_acc_div[,i]), by.x=1,by.y=1)[,2])
+  if (i<=m_fx)
+  {
+  VaRfr1_acc_div[i]=quantile(PGfr1_acc_div[,i],1-alpha,Ns)
+  CVaRfr1_acc_div[i]= mean(merge(which(PGfr1_acc_div[,i]<VaRfr1_acc_div[i]),cbind(seq(1,Ns),PGfr1_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+  if (i<=m_acc)
+  {  
+  VaRfr2_acc_div[i]=quantile(PGfr2_acc_div[,i],1-alpha,Ns)
+  CVaRfr2_acc_div[i]= mean(merge(which(PGfr2_acc_div[,i]<VaRfr2_acc_div[i]),cbind(seq(1,Ns),PGfr2_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+}
+#Met
+#VaRCont_acc_div
+#VaRfr1_acc_div
+#VaRfr2_acc_div
+#CVaRCont_acc_div
+#CVaRfr1_acc_div
+#CVaRfr2_acc_div
+
+
+#VaR Total
+#Met
+VaRTotal_acc_div=quantile(PGT_acc_div,1-alpha,Ns)
+CVaRTotal_acc_div= mean(merge(which(PGT_acc_div<VaRTotal_acc_div),cbind(seq(1,Ns),PGT_acc_div), by.x=1,by.y=1)[,2])
+VaRTotalfr1_acc_div=quantile(PGfr1T_acc_div,1-alpha,Ns)
+CVaRTotalfr1_acc_div= mean(PGfr1T_acc_div[which(PGfr1T_acc_div<VaRTotalfr1_acc_div),])
+VaRTotalfr2_acc_div=quantile(PGfr2T_acc_div,1-alpha,Ns)
+CVaRTotalfr2_acc_div= mean(PGfr2T_acc_div[which(PGfr2T_acc_div<VaRTotalfr2_acc_div),])
+
+#print("Var Empírico")
+#print(cbind(VaRTotal_acc_div,sum(V0_acc_div), VaRCont_acc_div, V0_acc_div))
+#print("CVar Empírico")
+#print(cbind(CVaRTotal_acc_div,sum(V0_acc_div), CVaRCont_acc_div, V0_acc_div))
+#print("Var Normal")
+#print(cbind(VaRTotal_acc_div,VaRTotalfr1_acc_div,,VaRTotalfr2_acc_div))
+#print("CVar Normal")
+#print(cbind(CVaRTotal_acc_div,CVaRTotalfr1_acc_div,CVaRTotalfr2_acc_div))
+#print(sum(V0_acc_div))
+titles<-c('EURUSD.X', 'GBPUSD.X', 'USDMXN.X', 'AMXL.MX', 'GCARSOA1.MX',  'WALMEX.MX')
+```
+
+```{r}
+print("Var Componentes principales empírico")
+print('Var total')
+print(VaRTotal_acc_div)
+print('Var por posición')
+print(cbind(titles,t(VaRCont_acc_div)))
+print('Var del contrato acciones')
+print(VaRTotalfr2_acc_div)
+print('Var del contrato divisas')
+print(VaRTotalfr1_acc_div)
+```
+
+```{r}
+print("CVar Empírico")
+print('CVar total')
+print(CVaRTotal_acc_div)
+print('CVar por posición')
+print(cbind(titles,t(CVaRCont_acc_div)))
+print('CVar del contrato acciones')
+print(CVaRTotalfr2_acc_div)
+print('CVar del contrato divisas')
+print(CVaRTotalfr1_acc_div)
+```
+
+### Bonos
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias BONDES
+#dimensión
+m=count(N_bd)    #PASO CLAVE
+X_s_bd=matrix(0,Ns,n_if[4]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_bd=matrix(0,Ns,m)
+Vfr1_bd=matrix(0,Ns,m)
+Vfr2_bd=matrix(0,Ns,m)
+Vfr3_bd=matrix(0,Ns,m)
+PG_bd=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_bd=matrix(0,Ns,m)
+PGfr2_bd=matrix(0,Ns,m)
+PGfr3_bd=matrix(0,Ns,m)
+PGT_bd=matrix(0,Ns,1)
+PGfr1T_bd=matrix(0,Ns,1)
+PGfr2T_bd=matrix(0,Ns,1)
+PGfr3T_bd=matrix(0,Ns,1)
+
+DeltaX_s_bd=DeltaX_s[,sum(n_if[1:3],1):sum(n_if[1:4])]    #PASO CLAVE
+x0_bd=X_bd_ext[1,]    #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_bd[i,]=x0_bd*(1+DeltaX_s_bd[i,])
+  #PASO CLAVE
+  V_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr1_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr2_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr3_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  PG_bd[i,]=V_bd[i,]-V0_bd
+  PGfr1_bd[i,]=Vfr1_bd[i,]-V0_bd
+  PGfr2_bd[i,]=Vfr2_bd[i,]-V0_bd
+  PGfr3_bd[i,]=Vfr3_bd[i,]-V0_bd
+  PGT_bd[i,]=sum(PG_bd[i,])
+  PGfr1T_bd[i,]=sum(PGfr1_bd[i,])
+  PGfr2T_bd[i,]=sum(PGfr2_bd[i,])
+  PGfr3T_bd[i,]=sum(PGfr3_bd[i,])
+}
+
+
+
+PG_bd[1:5,]
+PGfr1_bd[1:5,]
+PGfr2_bd[1:5,]
+PGT_bd[1:5,]
+
+
+#VaR por posición
+VaRCont_bd=matrix(0,1,m)
+VaRfr1_bd=matrix(0,1,m)
+VaRfr2_bd=matrix(0,1,m)
+VaRfr3_bd=matrix(0,1,m)
+CVaRCont_bd=matrix(0,1,m)
+CVaRfr1_bd=matrix(0,1,m)
+CVaRfr2_bd=matrix(0,1,m)
+CVaRfr3_bd=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_bd[i]=quantile(PG_bd[,i],1-alpha,Ns)
+  VaRfr1_bd[i]=quantile(PGfr1_bd[,i],1-alpha,Ns)
+  VaRfr2_bd[i]=quantile(PGfr2_bd[,i],1-alpha,Ns)
+  VaRfr3_bd[i]=quantile(PGfr3_bd[,i],1-alpha,Ns)
+  CVaRfr1_bd[i]= mean(merge(which(PGfr1_bd[,i]<VaRfr1_bd[i]),cbind(seq(1,Ns),PGfr1_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_bd[i]= mean(merge(which(PGfr2_bd[,i]<VaRfr2_bd[i]),cbind(seq(1,Ns),PGfr2_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_bd[i]= mean(merge(which(PGfr3_bd[,i]<VaRfr3_bd[i]),cbind(seq(1,Ns),PGfr3_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_bd[i]= mean(merge(which(PG_bd[,i]<VaRCont_bd[i]),cbind(seq(1,Ns),PG_bd[,i]), by.x=1,by.y=1)[,2])
+}
+Met
+VaRCont_bd
+VaRfr1_bd
+VaRfr2_bd
+CVaRCont_bd
+CVaRfr1_bd
+CVaRfr2_bd
+
+
+#VaR Total
+#Met
+VaRTotal_bd=quantile(PGT_bd,1-alpha,Ns)
+CVaRTotal_bd= mean(merge(which(PGT_bd<VaRTotal_bd),cbind(seq(1,Ns),PGT_bd), by.x=1,by.y=1)[,2])
+VaRTotalfr1_bd=quantile(PGfr1T_bd,1-alpha,Ns)
+CVaRTotalfr1_bd= mean(PGfr1T_bd[which(PGfr1T_bd<VaRTotalfr1_bd),])
+VaRTotalfr2_bd=quantile(PGfr2T_bd,1-alpha,Ns)
+CVaRTotalfr2_bd= mean(PGfr2T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+VaRTotalfr3_bd=quantile(PGfr3T_bd,1-alpha,Ns)
+CVaRTotalfr3_bd= mean(PGfr3T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+
+
+#cbind(VaRTotal_bd,sum(V0_bd), VaRCont_bd, V0_bd)
+#cbind(CVaRTotal_bd,sum(V0_bd), CVaRCont_bd, V0_bd)
+#cbind(VaRTotal_bd,VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd)
+#cbind(CVaRTotal_bd,CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd)
+lista<-c('Tasa descuento','tasa fondeo', 'sobretasa')
+```
+
+```{r}
+print('Var total')
+print(VaRTotal_bd)
+print('Var por factor de riesgo')
+print(rbind(lista,t(c(VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd))))
+
+```
+```{r}
+print('CVar total')
+print(CVaRTotal_bd)
+print('CVar por factor de riesgo')
+print(rbind(lista,t(c(CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd))))
+
+```
+
+### Forwards de Divisas
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS TDC
+#dimensión
+m=ncol(plazos_fwd)  #PASO CLAVE
+X_s_fwtdc=matrix(0,Ns,n_if[5]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwtdc=matrix(0,Ns,m)
+Vfr1_fwtdc=matrix(0,Ns,m)
+Vfr2_fwtdc=matrix(0,Ns,m)
+Vfr3_fwtdc=matrix(0,Ns,m)
+PG_fwtdc=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwtdc=matrix(0,Ns,m)
+PGfr2_fwtdc=matrix(0,Ns,m)
+PGfr3_fwtdc=matrix(0,Ns,m)
+PGT_fwtdc=matrix(0,Ns,1)
+PGfr1T_fwtdc=matrix(0,Ns,1)
+PGfr2T_fwtdc=matrix(0,Ns,1)
+PGfr3T_fwtdc=matrix(0,Ns,1)
+
+DeltaX_s_fwtdc=DeltaX_s[,sum(n_if[1:4],1):sum(n_if[1:5])]  #PASO CLAVE
+x0_fwtdc=X_futtdc[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_fwtdc[i,]=x0_fwtdc*(1+DeltaX_s_fwtdc[i,])
+  #PASO CLAVE
+  V_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd     
+  #PASO CLAVE
+  Vfr1_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr2_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr3_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  PG_fwtdc[i,]=V_fwtdc[i,]-V0_fwtdc
+  PGfr1_fwtdc[i,]=Vfr1_fwtdc[i,]-V0_fwtdc
+  PGfr2_fwtdc[i,]=Vfr2_fwtdc[i,]-V0_fwtdc
+  PGfr3_fwtdc[i,]=Vfr3_fwtdc[i,]-V0_fwtdc
+  PGT_fwtdc[i,]=sum(PG_fwtdc[i,])
+  PGfr1T_fwtdc[i,]=sum(PGfr1_fwtdc[i,])
+  PGfr2T_fwtdc[i,]=sum(PGfr2_fwtdc[i,])
+  PGfr3T_fwtdc[i,]=sum(PGfr3_fwtdc[i,])
+}
+
+
+
+PG_fwtdc[1:5,]
+PGfr1_fwtdc[1:5,]
+PGfr2_fwtdc[1:5,]
+PGT_fwtdc[1:5,]
+
+
+#VaR por posición
+VaRCont_fwtdc=matrix(0,1,m)
+VaRfr1_fwtdc=matrix(0,1,m)
+VaRfr2_fwtdc=matrix(0,1,m)
+VaRfr3_fwtdc=matrix(0,1,m)
+CVaRCont_fwtdc=matrix(0,1,m)
+CVaRfr1_fwtdc=matrix(0,1,m)
+CVaRfr2_fwtdc=matrix(0,1,m)
+CVaRfr3_fwtdc=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwtdc[i]=quantile(PG_fwtdc[,i],1-alpha,Ns)
+  VaRfr1_fwtdc[i]=quantile(PGfr1_fwtdc[,i],1-alpha,Ns)
+  VaRfr2_fwtdc[i]=quantile(PGfr2_fwtdc[,i],1-alpha,Ns)
+  VaRfr3_fwtdc[i]=quantile(PGfr3_fwtdc[,i],1-alpha,Ns)
+  CVaRfr1_fwtdc[i]= mean(merge(which(PGfr1_fwtdc[,i]<VaRfr1_fwtdc[i]),cbind(seq(1,Ns),PGfr1_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwtdc[i]= mean(merge(which(PGfr2_fwtdc[,i]<VaRfr2_fwtdc[i]),cbind(seq(1,Ns),PGfr2_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwtdc[i]= mean(merge(which(PGfr3_fwtdc[,i]<VaRfr3_fwtdc[i]),cbind(seq(1,Ns),PGfr3_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwtdc[i]= mean(merge(which(PG_fwtdc[,i]<VaRCont_fwtdc[i]),cbind(seq(1,Ns),PG_fwtdc[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwtdc
+#VaRfr1_fwtdc
+#VaRfr2_fwtdc
+#CVaRCont_fwtdc
+#CVaRfr1_fwtdc
+#CVaRfr2_fwtdc
+
+
+#VaR Total
+Met
+VaRTotal_fwtdc=quantile(PGT_fwtdc,1-alpha,Ns)
+CVaRTotal_fwtdc= mean(merge(which(PGT_fwtdc<VaRTotal_fwtdc),cbind(seq(1,Ns),PGT_fwtdc), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwtdc=quantile(PGfr1T_fwtdc,1-alpha,Ns)
+CVaRTotalfr1_fwtdc= mean(PGfr1T_fwtdc[which(PGfr1T_fwtdc<VaRTotalfr1_fwtdc),])
+VaRTotalfr2_fwtdc=quantile(PGfr2T_fwtdc,1-alpha,Ns)
+CVaRTotalfr2_fwtdc= mean(PGfr2T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+VaRTotalfr3_fwtdc=quantile(PGfr3T_fwtdc,1-alpha,Ns)
+CVaRTotalfr3_fwtdc= mean(PGfr3T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+
+
+#cbind(VaRTotal_fwtdc,sum(V0_fwtdc), VaRCont_fwtdc, V0_fwtdc)
+#cbind(CVaRTotal_fwtdc,sum(V0_fwtdc), CVaRCont_fwtdc, V0_fwtdc)
+cbind(VaRTotal_fwtdc,VaRTotalfr1_fwtdc,VaRTotalfr2_fwtdc,VaRTotalfr3_fwtdc)
+cbind(CVaRTotal_fwtdc,CVaRTotalfr1_fwtdc,CVaRTotalfr2_fwtdc,CVaRTotalfr3_fwtdc)
+```
+
+### Forwards IPC
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS IPC
+m=ncol(plazos_fwd_ind)  #PASO CLAVE
+X_s_fwind=matrix(0,Ns,n_if[6]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwind=matrix(0,Ns,m)
+Vfr1_fwind=matrix(0,Ns,m)
+Vfr2_fwind=matrix(0,Ns,m)
+Vfr3_fwind=matrix(0,Ns,m)
+PG_fwind=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwind=matrix(0,Ns,m)
+PGfr2_fwind=matrix(0,Ns,m)
+PGfr3_fwind=matrix(0,Ns,m)
+PGT_fwind=matrix(0,Ns,1)
+PGfr1T_fwind=matrix(0,Ns,1)
+PGfr2T_fwind=matrix(0,Ns,1)
+PGfr3T_fwind=matrix(0,Ns,1)
+
+DeltaX_s_fwind=DeltaX_s[,sum(n_if[1:5],1):sum(n_if[1:6])]  #PASO CLAVE
+x0_fwind=X_futind[1,] #PASO CLAVE
+
+
+for (i in 1:Ns)
+{
+  X_s_fwind[i,]=x0_fwind*(1+DeltaX_s_fwind[i,])
+  #PASO CLAVE
+  V_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind     
+  Vfr1_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr2_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr3_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  PG_fwind[i,]=V_fwind[i,]-V0_fwind
+  PGfr1_fwind[i,]=Vfr1_fwind[i,]-V0_fwind
+  PGfr2_fwind[i,]=Vfr2_fwind[i,]-V0_fwind
+  PGfr3_fwind[i,]=Vfr3_fwind[i,]-V0_fwind
+  PGT_fwind[i,]=sum(PG_fwind[i,])
+  PGfr1T_fwind[i,]=sum(PGfr1_fwind[i,])
+  PGfr2T_fwind[i,]=sum(PGfr2_fwind[i,])
+  PGfr3T_fwind[i,]=sum(PGfr3_fwind[i,])
+}
+
+
+PG_fwind[1:5,]
+#PGfr1_fwind[1:5,]
+#PGfr2_fwind[1:5,]
+#PGT_fwind[1:5,]
+
+
+
+#VaR por posición
+VaRCont_fwind=matrix(0,1,m)
+VaRfr1_fwind=matrix(0,1,m)
+VaRfr2_fwind=matrix(0,1,m)
+VaRfr3_fwind=matrix(0,1,m)
+CVaRCont_fwind=matrix(0,1,m)
+CVaRfr1_fwind=matrix(0,1,m)
+CVaRfr2_fwind=matrix(0,1,m)
+CVaRfr3_fwind=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwind[i]=quantile(PG_fwind[,i],1-alpha,Ns)
+  VaRfr1_fwind[i]=quantile(PGfr1_fwind[,i],1-alpha,Ns)
+  VaRfr2_fwind[i]=quantile(PGfr2_fwind[,i],1-alpha,Ns)
+  VaRfr3_fwind[i]=quantile(PGfr3_fwind[,i],1-alpha,Ns)
+  CVaRfr1_fwind[i]= mean(merge(which(PGfr1_fwind[,i]<VaRfr1_fwind[i]),cbind(seq(1,Ns),PGfr1_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwind[i]= mean(merge(which(PGfr2_fwind[,i]<VaRfr2_fwind[i]),cbind(seq(1,Ns),PGfr2_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwind[i]= mean(merge(which(PGfr3_fwind[,i]<VaRfr3_fwind[i]),cbind(seq(1,Ns),PGfr3_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwind[i]= mean(merge(which(PG_fwind[,i]<VaRCont_fwind[i]),cbind(seq(1,Ns),PG_fwind[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwind
+#VaRfr1_fwind
+#VaRfr2_fwind
+#CVaRCont_fwind
+#CVaRfr1_fwind
+#CVaRfr2_fwind
+
+
+#VaR Total
+Met
+VaRTotal_fwind=quantile(PGT_fwind,1-alpha,Ns)
+CVaRTotal_fwind= mean(merge(which(PGT_fwind<VaRTotal_fwind),cbind(seq(1,Ns),PGT_fwind), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwind=quantile(PGfr1T_fwind,1-alpha,Ns)
+CVaRTotalfr1_fwind= mean(PGfr1T_fwind[which(PGfr1T_fwind<VaRTotalfr1_fwind),])
+VaRTotalfr2_fwind=quantile(PGfr2T_fwind,1-alpha,Ns)
+CVaRTotalfr2_fwind= mean(PGfr2T_fwind[which(PGfr2T_fwind<VaRTotalfr2_fwind),])
+VaRTotalfr3_fwind=quantile(PGfr3T_fwind,1-alpha,Ns)
+CVaRTotalfr3_fwind= mean(PGfr3T_fwind[which(PGfr3T_fwind<VaRTotalfr3_fwind),])
+
+
+#print(cbind(VaRTotal_fwind,sum(V0_fwind), VaRCont_fwind, V0_fwind))
+#print(cbind(CVaRTotal_fwind,sum(V0_fwind), CVaRCont_fwind, V0_fwind))
+print(cbind(VaRTotal_fwind,VaRTotalfr1_fwind,VaRTotalfr2_fwind,VaRTotalfr3_fwind))
+cbind(CVaRTotal_fwind,CVaRTotalfr1_fwind,CVaRTotalfr2_fwind,CVaRTotalfr3_fwind)
+
+
+```
+### Swaps
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias SWAP
+
+#riesgo del swap
+m=ncol(N)    #PASO CLAVE
+X_s_sw=matrix(0,Ns,n_if[7]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_sw=matrix(0,Ns,m)
+Vfr1_sw=matrix(0,Ns,m)
+Vfr2_sw=matrix(0,Ns,m)
+PG_sw=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_sw=matrix(0,Ns,m)
+PGfr2_sw=matrix(0,Ns,m)
+PGT_sw=matrix(0,Ns,1)
+PGfr1T_sw=matrix(0,Ns,1)
+PGfr2T_sw=matrix(0,Ns,1)
+
+DeltaX_s_sw=DeltaX_s[,sum(n_if[1:6],1):sum(n_if[1:7])]    #PASO CLAVE
+x0_sw=as.numeric(c(XtfwdT[1,],Xvp[1,]))   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_sw[i,]=x0_sw*(1+DeltaX_s_sw[i,])
+  #PASO CLAVE
+  V_sw[i,]=swap(por_swT, contratos_swT, nominal_swT, X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  Vfr1_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, Xvp[1,],N)
+  #PASO CLAVE
+  Vfr2_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,  XtfwdT[1,], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  PG_sw[i,]=V_sw[i,]-V0_sw
+  PGfr1_sw[i,]=Vfr1_sw[i,]-V0_sw
+  PGfr2_sw[i,]=Vfr2_sw[i,]-V0_sw
+  PGT_sw[i,]=sum(PG_sw[i,])
+  PGfr1T_sw[i,]=sum(PGfr1_sw[i,])
+  PGfr2T_sw[i,]=sum(PGfr2_sw[i,])
+}
+
+
+
+PG_sw[1:5,]
+PGfr1_sw[1:5,]
+PGfr2_sw[1:5,]
+PGT_sw[1:5,]
+
+
+#VaR por posición
+VaRCont_sw=matrix(0,1,m)
+VaRfr1_sw=matrix(0,1,m)
+VaRfr2_sw=matrix(0,1,m)
+CVaRCont_sw=matrix(0,1,m)
+CVaRfr1_sw=matrix(0,1,m)
+CVaRfr2_sw=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_sw[i]=quantile(PG_sw[,i],1-alpha,Ns)
+  VaRfr1_sw[i]=quantile(PGfr1_sw[,i],1-alpha,Ns)
+  VaRfr2_sw[i]=quantile(PGfr2_sw[,i],1-alpha,Ns)
+  CVaRfr1_sw[i]= mean(merge(which(PGfr1_sw[,i]<VaRfr1_sw[i]),cbind(seq(1,Ns),PGfr1_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_sw[i]= mean(merge(which(PGfr2_sw[,i]<VaRfr2_sw[i]),cbind(seq(1,Ns),PGfr2_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_sw[i]= mean(merge(which(PG_sw[,i]<VaRCont_sw[i]),cbind(seq(1,Ns),PG_sw[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_sw
+#VaRfr1_sw
+#VaRfr2_sw
+#CVaRCont_sw
+#CVaRfr1_sw
+#CVaRfr2_sw
+
+
+#VaR Total
+Met
+VaRTotal_sw=quantile(PGT_sw,1-alpha,Ns)
+CVaRTotal_sw= mean(merge(which(PGT_sw<VaRTotal_sw),cbind(seq(1,Ns),PGT_sw), by.x=1,by.y=1)[,2])
+VaRTotalfr1_sw=quantile(PGfr1T_sw,1-alpha,Ns)
+CVaRTotalfr1_sw= mean(PGfr1T_sw[which(PGfr1T_sw<VaRTotalfr1_sw),])
+VaRTotalfr2_sw=quantile(PGfr2T_sw,1-alpha,Ns)
+CVaRTotalfr2_sw= mean(PGfr2T_sw[which(PGfr2T_sw<VaRTotalfr2_sw),])
+
+
+cbind(VaRTotal_sw, VaRCont_sw)
+cbind(CVaRTotal_sw, CVaRCont_sw)
+cbind(VaRTotal_sw,VaRTotalfr1_sw,VaRTotalfr2_sw)
+cbind(CVaRTotal_sw,CVaRTotalfr1_sw,CVaRTotalfr2_sw)
+
+```
+
+### Opciones de tasa de interés
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias Opciones Tasa de interés
+#dimensión
+m=ncol(plazos_oir)  #PASO CLAVE
+X_s_oir=matrix(0,Ns,n_if[8]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_oir=matrix(0,Ns,m)
+Vfr1_oir=matrix(0,Ns,m)
+Vfr2_oir=matrix(0,Ns,m)
+Vfr3_oir=matrix(0,Ns,m)
+PG_oir=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_oir=matrix(0,Ns,m)
+PGfr2_oir=matrix(0,Ns,m)
+PGfr3_oir=matrix(0,Ns,m)
+PGT_oir=matrix(0,Ns,1)
+PGfr1T_oir=matrix(0,Ns,1)
+PGfr2T_oir=matrix(0,Ns,1)
+PGfr3T_oir=matrix(0,Ns,1)
+
+DeltaX_s_oir=DeltaX_s[,sum(n_if[1:7],1):sum(n_if[1:8])]  #PASO CLAVE
+x0_oir=X_oir[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_oir[i,]=x0_oir*(1+DeltaX_s_oir[i,])
+  #PASO CLAVE
+  V_oir[i,]=  opctint(X_s_oir[i,(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr1_oir[i,]=opctint(X_s_oir[i,(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr2_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr3_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  PG_oir[i,]=V_oir[i,]-V0_oir
+  PGfr1_oir[i,]=Vfr1_oir[i,]-V0_oir
+  PGfr2_oir[i,]=Vfr2_oir[i,]-V0_oir
+  PGfr3_oir[i,]=Vfr3_oir[i,]-V0_oir
+  PGT_oir[i,]=sum(PG_oir[i,])
+  PGfr1T_oir[i,]=sum(PGfr1_oir[i,])
+  PGfr2T_oir[i,]=sum(PGfr2_oir[i,])
+  PGfr3T_oir[i,]=sum(PGfr3_oir[i,])
+}
+
+
+
+PG_oir[1:5,]
+PGfr1_oir[1:5,]
+PGfr2_oir[1:5,]
+PGT_oir[1:5,]
+
+
+#VaR por posición
+VaRCont_oir=matrix(0,1,m)
+VaRfr1_oir=matrix(0,1,m)
+VaRfr2_oir=matrix(0,1,m)
+VaRfr3_oir=matrix(0,1,m)
+CVaRCont_oir=matrix(0,1,m)
+CVaRfr1_oir=matrix(0,1,m)
+CVaRfr2_oir=matrix(0,1,m)
+CVaRfr3_oir=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_oir[i]=quantile(PG_oir[,i],1-alpha,Ns)
+  VaRfr1_oir[i]=quantile(PGfr1_oir[,i],1-alpha,Ns)
+  VaRfr2_oir[i]=quantile(PGfr2_oir[,i],1-alpha,Ns)
+  VaRfr3_oir[i]=quantile(PGfr3_oir[,i],1-alpha,Ns)
+  CVaRfr1_oir[i]= mean(merge(which(PGfr1_oir[,i]<VaRfr1_oir[i]),cbind(seq(1,Ns),PGfr1_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_oir[i]= mean(merge(which(PGfr2_oir[,i]<VaRfr2_oir[i]),cbind(seq(1,Ns),PGfr2_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_oir[i]= mean(merge(which(PGfr3_oir[,i]<VaRfr3_oir[i]),cbind(seq(1,Ns),PGfr3_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_oir[i]= mean(merge(which(PG_oir[,i]<VaRCont_oir[i]),cbind(seq(1,Ns),PG_oir[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_oir
+#VaRfr1_oir
+#VaRfr2_oir
+#CVaRCont_oir
+#CVaRfr1_oir
+#CVaRfr2_oir
+
+
+#VaR Total
+#Met
+VaRTotal_oir=quantile(PGT_oir,1-alpha,Ns)
+CVaRTotal_oir= mean(merge(which(PGT_oir<VaRTotal_oir),cbind(seq(1,Ns),PGT_oir), by.x=1,by.y=1)[,2])
+VaRTotalfr1_oir=quantile(PGfr1T_oir,1-alpha,Ns)
+CVaRTotalfr1_oir= mean(PGfr1T_oir[which(PGfr1T_oir<VaRTotalfr1_oir),])
+VaRTotalfr2_oir=quantile(PGfr2T_oir,1-alpha,Ns)
+CVaRTotalfr2_oir= mean(PGfr2T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+VaRTotalfr3_oir=quantile(PGfr3T_oir,1-alpha,Ns)
+CVaRTotalfr3_oir= mean(PGfr3T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+
+
+cbind(VaRTotal_oir, VaRCont_oir)
+cbind(CVaRTotal_oir, CVaRCont_oir)
+cbind(VaRTotal_oir,VaRTotalfr1_oir,VaRTotalfr2_oir,VaRTotalfr3_oir)
+cbind(CVaRTotal_oir,CVaRTotalfr1_oir,CVaRTotalfr2_oir,CVaRTotalfr3_oir)
+```
+### Riesgo total del portafolio
+```{r}
+#Medición de riesgo por factor de riesgo de todo el portafolios
+#Acciones
+#1. Acciones 
+#2. Forward de IPC
+PGPort_ACC=PGfr2T_acc_div+ PGfr3T_fwind #Pérdidas y ganancias
+VaRPort_ACC=quantile(PGPort_ACC,1-alpha,Ns) #VaR
+CVaRPort_ACC= mean(PGPort_ACC[which(PGPort_ACC<VaRPort_ACC)]) #CVaR
+
+print(VaRPort_ACC)
+print(CVaRPort_ACC)
+
+```
+
+```{r}
+#Tasa de Interés
+#1. Dado que swaps y bondes son de tasa de interés usaremos PGT_bd y PGT_sw
+#2. Para futuros usaremos PGfr1T_fwtdc y PGfr2T_fwtdc
+PGPort_TI=PGT_bd+PGT_sw+PGfr1T_fwtdc+PGfr2T_fwtdc +PGfr2T_fwind+PGfr1T_fwind +PGfr1T_oir +PGfr2T_oir #Pérdidas y ganancias
+VaRPort_TI=quantile(PGPort_TI,1-alpha,Ns) #VaR
+CVaRPort_TI= mean(PGPort_TI[which(PGPort_TI<VaRPort_TI)]) #CVaR
+print(VaRPort_TI)
+print(CVaRPort_TI)
+```
+
+```{r}
+#Tipo de cambio
+#1. Dado que swaps y bondes son de tasa de interés no usamos nada
+#2. Para futuros usamos sólo PGfr3T_fwtdc
+PGPort_TDC=PGfr1T_acc_div+PGfr3T_fwtdc  #Pérdidas y ganancias
+VaRPort_TDC=quantile(PGPort_TDC,1-alpha,Ns) #VaR
+CVaRPort_TDC= mean(PGPort_TDC[which(PGPort_TDC<VaRPort_TDC)]) #CVaR
+print(VaRPort_TDC)
+print(CVaRPort_TDC)
+
+
+```
+
+```{r}
+#Volatilidad
+#1. Sólo aplica la volatilidad de Opciones de tasa de interés
+
+PGPort_VOL=PGfr3T_oir  #Pérdidas y ganancias
+VaRPort_VOL=quantile(PGPort_VOL,1-alpha,Ns) #VaR
+CVaRPort_VOL= mean(PGPort_VOL[which(PGPort_VOL<VaRPort_VOL)]) #CVaR
+
+print(VaRPort_VOL)
+print(CVaRPort_VOL)
+
+```
+
+```{r}
+#Medición de riesgo de todo el portafolios
+#Sumar todos los PGT de todos los instrumentos
+
+PGT_Port=PGPort_ACC+PGPort_TI+PGPort_TDC+PGPort_VOL
+VaRTotal_Port=quantile(PGT_Port,1-alpha,Ns) #VaR
+CVaRTotal_Port= mean(PGT_Port[which(PGT_Port<VaRTotal_Port)]) #CVaR
+print(VaRTotal_Port)
+print(CVaRTotal_Port)
+print(V0T_port)
+```
+
+### Por componentes principales normal
+
+```{r}
+
+#DIMENSION DE TODOS LOS INSTRUMENTOS
+#Son 8 instrumentos financieros (9 si separamos acciones y divisas)
+n_if=matrix(0,8,1)
+n_if[1]=ncol(stock_prices_EQFX) #acciones y divisas
+n_if[2]=ncol(x_bcc) #cetes
+n_if[3]=ncol(X_bm) #bonos m
+n_if[4]=ncol(X_bd_ext) #bonde
+n_if[5]=ncol(X_futtdc) #fut tdc
+n_if[6]=ncol(X_futind) #fut ind
+n_if[7]=ncol(X_sw) #swaps
+n_if[8]=ncol(X_oir) #opciones tasa de interés
+
+#valor del portafolios
+
+V0_port=cbind(V0_acc_div,V0_bcc, V0_bm, V0_bd, V0_fwtdc, V0_fwind, V0_sw, V0_oir) #contrato
+V0T_port=sum(V0_port)
+
+
+
+#INTEGRACIÓN DE TODOS LOS FACTORES DE RIESGO EN UNA MATRIZ
+X_port=cbind(stock_prices_EQFX,x_bcc,X_bm,X_bd_ext,X_futtdc,X_futind,X_sw,X_oir) #Factores de riesgo del portafolios de 8(9) instrumentos financieros
+
+#Cálculo de variaciones Delta_X DEL PORTAFOLIOS
+DeltaX_port=as.matrix(X_port[1:(n-1),]/X_port[2:(n),]-1)
+DeltaX_port[is.nan(DeltaX_port)] <- 0 #quitamos NaN
+DeltaX_port[is.na(DeltaX_port)] <- 0 #quitamos Na
+DeltaX_port[is.infinite(DeltaX_port)] <- 0 #quitamos Na
+
+
+Ns=10000 #Definimos número de simulaciones
+alpha=0.98 #Nivel de Confianza para las medidas de riesgo
+ChCP=1  #0 Cholesky, 1 Componentes Principales
+normempi=0 #0 normal, 1 empírico
+eta=.85 #Varianza explicada  (sólo aplica para Componentes Principales)
+mT=ncol(DeltaX_port)
+
+
+VarDeltaX=if(ChCP==0){cor(DeltaX_port)}else{var(DeltaX_port)*(ncol(DeltaX_port)/(ncol(DeltaX_port)-1))}
+
+if(ChCP==0) {
+  CVarDeltaX=as.matrix(chol(VarDeltaX,pivot=TRUE))
+  CVarDeltaX[is.nan(CVarDeltaX)] <- 0 #quitamos NaN
+  CVarDeltaX[is.na(CVarDeltaX)] <- 0 #quitamos Na
+  print(ncol(CVarDeltaX))
+  print(ncol(VarDeltaX))
+  M=matrix(0, Ns,mT)
+  if(normempi==1)
+  {
+    for (i in 1:mT)
+    {
+      M[,i]=quantile(DeltaX_port[,i],runif(Ns))
+    }
+    Met='Cholesky Empírico'
+  } else	{
+    for (i in 1:mT)
+    {
+      M[,i]=rnorm(Ns)*sd(DeltaX_port[,i])*(mT/(mT-1))+mean(DeltaX_port[,i])
+    }
+    Met='Cholesky Normal'
+  }
+  DeltaX_s=M%*%CVarDeltaX  #Factores de riesgo simulados
+} else { #componentes principales
+  G<-eigen(VarDeltaX)      #eigenvectores
+  g1<-G$values                  #eigenvalores
+  g1p=g1/sum(g1)
+  
+  g1pac=cumsum(g1p) #suma acumulada de varianza
+  
+  k=which.max(g1pac>eta) #valor mínimo k
+  
+  y=as.matrix((DeltaX_port-colMeans(DeltaX_port)))%*%G$vectors[,1:k] #componentes principales
+  #/sqrt(diag(var(DeltaX))))
+  M=matrix(0, Ns,k)
+  if(normempi==0)
+  {
+    for (i in 1:k)
+    {
+      M[,i]=rnorm(Ns)*sd(y[,i])+mean(y[,i])
+    }
+    Met='Componentes Principales Normales'
+  } else	{
+    for (i in 1:k)
+    {
+      M[,i]=quantile(y[,i],runif(Ns))
+    }
+    Met='Componentes Principales Empíricos'
+  }
+  DeltaX_s=M%*% t(G$vectors[,1:k]) #Factores de riesgo simulados
+}
+#Met
+#DeltaX_port[1:5,]
+
+
+#Met
+
+
+Ms1='Se explica el' 
+Ms2= 'de varianza'
+Ms3= 'de suma de var-cov'
+
+Ms1
+print(sum(diag(var(DeltaX_s)))/sum(diag(var(DeltaX_port)))) #Comprobación de matriz de varianza-cov vs original
+Ms2
+
+Ms1
+print(matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_s)%*%t(matrix(1,1,ncol(DeltaX_s)))/matrix(1,1,ncol(DeltaX_s))%*%var(DeltaX_port)%*%t(matrix(1,1,ncol(DeltaX_s)))) #Comprobación de matriz de varianza-cov vs original
+Ms3
+
+print(mT)
+#print(k) #número de variables simuladas
+#print(g1pac)
+```
+
+### Medición del riesgo 
+#### Acciones y divisas
+```{r}
+#Medición de riesgo por instrumento, instrumento-factor de riesgo, instrumento - total
+
+
+#Cálculo de matriz de pérdidas y ganancias Acciones y Divisas
+
+#riesgo del acciones y divisas
+m=n_if[1]   #PASO CLAVE
+X_s_acc_div=matrix(0,Ns,n_if[1]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_acc_div=matrix(0,Ns,m) #valor simulado a nivel contrato de acciones y tdc
+Vfr1_acc_div=matrix(0,Ns,m_fx) #valor simulado a nivel contrato de tdc
+Vfr2_acc_div=matrix(0,Ns,m_acc) #valor simulado a nivel contrato de acciones
+PG_acc_div=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_acc_div=matrix(0,Ns,m_fx) 
+PGfr2_acc_div=matrix(0,Ns,m_acc)
+PGT_acc_div=matrix(0,Ns,1) #TOTAL ACC Y DIV
+PGfr1T_acc_div=matrix(0,Ns,1) #total factor riesgo divisas
+PGfr2T_acc_div=matrix(0,Ns,1) #total factor riesgo acciones
+
+DeltaX_s_acc_div=DeltaX_s[,(1:n_if[1])]    #PASO CLAVE
+x0_acc_div=stock_prices_EQFX[1,]   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_acc_div[i,]=as.matrix(x0_acc_div*(1+DeltaX_s_acc_div[i,]))
+  #PASO CLAVE
+  V_acc_div[i,]=cbind(t(pos_fx),t(pos_eq))*X_s_acc_div[i,]
+  #PASO CLAVE
+  Vfr1_acc_div[i,]=t(pos_fx)*X_s_acc_div[i,1:m_fx]
+  #PASO CLAVE
+  Vfr2_acc_div[i,]=t(pos_eq)*X_s_acc_div[i,(m_fx+1):(m_fx+m_acc)]
+  #PASO CLAVE
+  PG_acc_div[i,]=as.matrix(V_acc_div[i,]-V0_acc_div)
+  PGfr1_acc_div[i,]=as.matrix(Vfr1_acc_div[i,]-V0_acc_div[,1:m_fx])
+  PGfr2_acc_div[i,]=as.matrix(Vfr2_acc_div[i,]-V0_acc_div[,(m_fx+1):(m_fx+m_acc)])
+  PGT_acc_div[i,]=sum(PG_acc_div[i,])
+  PGfr1T_acc_div[i,]=sum(PGfr1_acc_div[i,])
+  PGfr2T_acc_div[i,]=sum(PGfr2_acc_div[i,])
+}
+
+print(V_acc_div[1:3,])
+print(Vfr1_acc_div[1:3,])
+print(Vfr2_acc_div[1:3,])
+
+
+PG_acc_div[1:5,]
+PGfr1_acc_div[1:5,]
+PGfr2_acc_div[1:5,]
+PGT_acc_div[1:5,]
+
+
+#VaR por posición
+VaRCont_acc_div=matrix(0,1,m)
+VaRfr1_acc_div=matrix(0,1,m_fx)
+VaRfr2_acc_div=matrix(0,1,m_acc)
+CVaRCont_acc_div=matrix(0,1,m)
+CVaRfr1_acc_div=matrix(0,1,m_fx)
+CVaRfr2_acc_div=matrix(0,1,m_acc)
+for (i in (1:m))
+{
+  VaRCont_acc_div[i]=quantile(PG_acc_div[,i],1-alpha,Ns)
+  CVaRCont_acc_div[i]= mean(merge(which(PG_acc_div[,i]<VaRCont_acc_div[i]),cbind(seq(1,Ns),PG_acc_div[,i]), by.x=1,by.y=1)[,2])
+  if (i<=m_fx)
+  {
+  VaRfr1_acc_div[i]=quantile(PGfr1_acc_div[,i],1-alpha,Ns)
+  CVaRfr1_acc_div[i]= mean(merge(which(PGfr1_acc_div[,i]<VaRfr1_acc_div[i]),cbind(seq(1,Ns),PGfr1_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+  if (i<=m_acc)
+  {  
+  VaRfr2_acc_div[i]=quantile(PGfr2_acc_div[,i],1-alpha,Ns)
+  CVaRfr2_acc_div[i]= mean(merge(which(PGfr2_acc_div[,i]<VaRfr2_acc_div[i]),cbind(seq(1,Ns),PGfr2_acc_div[,i]), by.x=1,by.y=1)[,2])
+  }
+}
+#Met
+#VaRCont_acc_div
+#VaRfr1_acc_div
+#VaRfr2_acc_div
+#CVaRCont_acc_div
+#CVaRfr1_acc_div
+#CVaRfr2_acc_div
+
+
+#VaR Total
+#Met
+VaRTotal_acc_div=quantile(PGT_acc_div,1-alpha,Ns)
+CVaRTotal_acc_div= mean(merge(which(PGT_acc_div<VaRTotal_acc_div),cbind(seq(1,Ns),PGT_acc_div), by.x=1,by.y=1)[,2])
+VaRTotalfr1_acc_div=quantile(PGfr1T_acc_div,1-alpha,Ns)
+CVaRTotalfr1_acc_div= mean(PGfr1T_acc_div[which(PGfr1T_acc_div<VaRTotalfr1_acc_div),])
+VaRTotalfr2_acc_div=quantile(PGfr2T_acc_div,1-alpha,Ns)
+CVaRTotalfr2_acc_div= mean(PGfr2T_acc_div[which(PGfr2T_acc_div<VaRTotalfr2_acc_div),])
+
+#print("Var Empírico")
+#print(cbind(VaRTotal_acc_div,sum(V0_acc_div), VaRCont_acc_div, V0_acc_div))
+#print("CVar Empírico")
+#print(cbind(CVaRTotal_acc_div,sum(V0_acc_div), CVaRCont_acc_div, V0_acc_div))
+#print("Var Normal")
+#print(cbind(VaRTotal_acc_div,VaRTotalfr1_acc_div,,VaRTotalfr2_acc_div))
+#print("CVar Normal")
+#print(cbind(CVaRTotal_acc_div,CVaRTotalfr1_acc_div,CVaRTotalfr2_acc_div))
+#print(sum(V0_acc_div))
+titles<-c('EURUSD.X', 'GBPUSD.X', 'USDMXN.X', 'AMXL.MX', 'GCARSOA1.MX',  'WALMEX.MX')
+```
+
+```{r}
+print("Var Normal")
+print('Var total')
+print(VaRTotal_acc_div)
+print('Var por posición')
+print(cbind(titles,t(VaRCont_acc_div)))
+print('Var del contrato acciones')
+print(VaRTotalfr2_acc_div)
+print('Var del contrato divisas')
+print(VaRTotalfr1_acc_div)
+```
+
+```{r}
+print("CVar Empírico")
+print('CVar total')
+print(CVaRTotal_acc_div)
+print('CVar por posición')
+print(cbind(titles,t(CVaRCont_acc_div)))
+print('CVar del contrato acciones')
+print(CVaRTotalfr2_acc_div)
+print('CVar del contrato divisas')
+print(CVaRTotalfr1_acc_div)
+```
+
+### Bonos
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias BONDES
+#dimensión
+m=count(N_bd)    #PASO CLAVE
+X_s_bd=matrix(0,Ns,n_if[4]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_bd=matrix(0,Ns,m)
+Vfr1_bd=matrix(0,Ns,m)
+Vfr2_bd=matrix(0,Ns,m)
+Vfr3_bd=matrix(0,Ns,m)
+PG_bd=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_bd=matrix(0,Ns,m)
+PGfr2_bd=matrix(0,Ns,m)
+PGfr3_bd=matrix(0,Ns,m)
+PGT_bd=matrix(0,Ns,1)
+PGfr1T_bd=matrix(0,Ns,1)
+PGfr2T_bd=matrix(0,Ns,1)
+PGfr3T_bd=matrix(0,Ns,1)
+
+DeltaX_s_bd=DeltaX_s[,sum(n_if[1:3],1):sum(n_if[1:4])]    #PASO CLAVE
+x0_bd=X_bd_ext[1,]    #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_bd[i,]=x0_bd*(1+DeltaX_s_bd[i,])
+  #PASO CLAVE
+  V_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr1_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, X_s_bd[i,1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr2_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, X_s_bd[i,(n_if[4]/3+1):(n_if[4]*2/3)], x0_bd[(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  Vfr3_bd[i,]=bondeD(contratos_bdmT, nominal_bdm, x0_bd[1], plazocupon_bdmT, VTplazos_bdm, x0_bd[(n_if[4]/3+1):(n_if[4]*2/3)], X_s_bd[i,(n_if[4]*2/3+1):(n_if[4])], N_bd,ddv)
+  #PASO CLAVE
+  PG_bd[i,]=V_bd[i,]-V0_bd
+  PGfr1_bd[i,]=Vfr1_bd[i,]-V0_bd
+  PGfr2_bd[i,]=Vfr2_bd[i,]-V0_bd
+  PGfr3_bd[i,]=Vfr3_bd[i,]-V0_bd
+  PGT_bd[i,]=sum(PG_bd[i,])
+  PGfr1T_bd[i,]=sum(PGfr1_bd[i,])
+  PGfr2T_bd[i,]=sum(PGfr2_bd[i,])
+  PGfr3T_bd[i,]=sum(PGfr3_bd[i,])
+}
+
+
+
+PG_bd[1:5,]
+PGfr1_bd[1:5,]
+PGfr2_bd[1:5,]
+PGT_bd[1:5,]
+
+
+#VaR por posición
+VaRCont_bd=matrix(0,1,m)
+VaRfr1_bd=matrix(0,1,m)
+VaRfr2_bd=matrix(0,1,m)
+VaRfr3_bd=matrix(0,1,m)
+CVaRCont_bd=matrix(0,1,m)
+CVaRfr1_bd=matrix(0,1,m)
+CVaRfr2_bd=matrix(0,1,m)
+CVaRfr3_bd=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_bd[i]=quantile(PG_bd[,i],1-alpha,Ns)
+  VaRfr1_bd[i]=quantile(PGfr1_bd[,i],1-alpha,Ns)
+  VaRfr2_bd[i]=quantile(PGfr2_bd[,i],1-alpha,Ns)
+  VaRfr3_bd[i]=quantile(PGfr3_bd[,i],1-alpha,Ns)
+  CVaRfr1_bd[i]= mean(merge(which(PGfr1_bd[,i]<VaRfr1_bd[i]),cbind(seq(1,Ns),PGfr1_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_bd[i]= mean(merge(which(PGfr2_bd[,i]<VaRfr2_bd[i]),cbind(seq(1,Ns),PGfr2_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_bd[i]= mean(merge(which(PGfr3_bd[,i]<VaRfr3_bd[i]),cbind(seq(1,Ns),PGfr3_bd[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_bd[i]= mean(merge(which(PG_bd[,i]<VaRCont_bd[i]),cbind(seq(1,Ns),PG_bd[,i]), by.x=1,by.y=1)[,2])
+}
+Met
+VaRCont_bd
+VaRfr1_bd
+VaRfr2_bd
+CVaRCont_bd
+CVaRfr1_bd
+CVaRfr2_bd
+
+
+#VaR Total
+#Met
+VaRTotal_bd=quantile(PGT_bd,1-alpha,Ns)
+CVaRTotal_bd= mean(merge(which(PGT_bd<VaRTotal_bd),cbind(seq(1,Ns),PGT_bd), by.x=1,by.y=1)[,2])
+VaRTotalfr1_bd=quantile(PGfr1T_bd,1-alpha,Ns)
+CVaRTotalfr1_bd= mean(PGfr1T_bd[which(PGfr1T_bd<VaRTotalfr1_bd),])
+VaRTotalfr2_bd=quantile(PGfr2T_bd,1-alpha,Ns)
+CVaRTotalfr2_bd= mean(PGfr2T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+VaRTotalfr3_bd=quantile(PGfr3T_bd,1-alpha,Ns)
+CVaRTotalfr3_bd= mean(PGfr3T_bd[which(PGfr2T_bd<VaRTotalfr2_bd),])
+
+
+#cbind(VaRTotal_bd,sum(V0_bd), VaRCont_bd, V0_bd)
+#cbind(CVaRTotal_bd,sum(V0_bd), CVaRCont_bd, V0_bd)
+#cbind(VaRTotal_bd,VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd)
+#cbind(CVaRTotal_bd,CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd)
+lista<-c('Tasa descuento','tasa fondeo', 'sobretasa')
+```
+
+```{r}
+print('Var total')
+print(VaRTotal_bd)
+print('Var por factor de riesgo')
+print(rbind(lista,t(c(VaRTotalfr1_bd,VaRTotalfr2_bd,VaRTotalfr3_bd))))
+
+```
+```{r}
+print('CVar total')
+print(CVaRTotal_bd)
+print('CVar por factor de riesgo')
+print(rbind(lista,t(c(CVaRTotalfr1_bd,CVaRTotalfr2_bd,CVaRTotalfr3_bd))))
+
+```
+
+### Forwards de Divisas
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS TDC
+#dimensión
+m=ncol(plazos_fwd)  #PASO CLAVE
+X_s_fwtdc=matrix(0,Ns,n_if[5]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwtdc=matrix(0,Ns,m)
+Vfr1_fwtdc=matrix(0,Ns,m)
+Vfr2_fwtdc=matrix(0,Ns,m)
+Vfr3_fwtdc=matrix(0,Ns,m)
+PG_fwtdc=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwtdc=matrix(0,Ns,m)
+PGfr2_fwtdc=matrix(0,Ns,m)
+PGfr3_fwtdc=matrix(0,Ns,m)
+PGT_fwtdc=matrix(0,Ns,1)
+PGfr1T_fwtdc=matrix(0,Ns,1)
+PGfr2T_fwtdc=matrix(0,Ns,1)
+PGfr3T_fwtdc=matrix(0,Ns,1)
+
+DeltaX_s_fwtdc=DeltaX_s[,sum(n_if[1:4],1):sum(n_if[1:5])]  #PASO CLAVE
+x0_fwtdc=X_futtdc[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_fwtdc[i,]=x0_fwtdc*(1+DeltaX_s_fwtdc[i,])
+  #PASO CLAVE
+  V_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd     
+  #PASO CLAVE
+  Vfr1_fwtdc[i,]=futuroTC(plazos_fwd,X_s_fwtdc[i,1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr2_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],X_s_fwtdc[i,((n_if[5]-1)/2+1):(n_if[5]-1)],x0_fwtdc[(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  #PASO CLAVE
+  Vfr3_fwtdc[i,]=futuroTC(plazos_fwd,x0_fwtdc[1:((n_if[5]-1)/2)],x0_fwtdc[((n_if[5]-1)/2+1):(n_if[5]-1)],X_s_fwtdc[i,(n_if[5])],kst_fwd)*contratos_fwd*nominal_fwd
+  PG_fwtdc[i,]=V_fwtdc[i,]-V0_fwtdc
+  PGfr1_fwtdc[i,]=Vfr1_fwtdc[i,]-V0_fwtdc
+  PGfr2_fwtdc[i,]=Vfr2_fwtdc[i,]-V0_fwtdc
+  PGfr3_fwtdc[i,]=Vfr3_fwtdc[i,]-V0_fwtdc
+  PGT_fwtdc[i,]=sum(PG_fwtdc[i,])
+  PGfr1T_fwtdc[i,]=sum(PGfr1_fwtdc[i,])
+  PGfr2T_fwtdc[i,]=sum(PGfr2_fwtdc[i,])
+  PGfr3T_fwtdc[i,]=sum(PGfr3_fwtdc[i,])
+}
+
+
+
+PG_fwtdc[1:5,]
+PGfr1_fwtdc[1:5,]
+PGfr2_fwtdc[1:5,]
+PGT_fwtdc[1:5,]
+
+
+#VaR por posición
+VaRCont_fwtdc=matrix(0,1,m)
+VaRfr1_fwtdc=matrix(0,1,m)
+VaRfr2_fwtdc=matrix(0,1,m)
+VaRfr3_fwtdc=matrix(0,1,m)
+CVaRCont_fwtdc=matrix(0,1,m)
+CVaRfr1_fwtdc=matrix(0,1,m)
+CVaRfr2_fwtdc=matrix(0,1,m)
+CVaRfr3_fwtdc=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwtdc[i]=quantile(PG_fwtdc[,i],1-alpha,Ns)
+  VaRfr1_fwtdc[i]=quantile(PGfr1_fwtdc[,i],1-alpha,Ns)
+  VaRfr2_fwtdc[i]=quantile(PGfr2_fwtdc[,i],1-alpha,Ns)
+  VaRfr3_fwtdc[i]=quantile(PGfr3_fwtdc[,i],1-alpha,Ns)
+  CVaRfr1_fwtdc[i]= mean(merge(which(PGfr1_fwtdc[,i]<VaRfr1_fwtdc[i]),cbind(seq(1,Ns),PGfr1_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwtdc[i]= mean(merge(which(PGfr2_fwtdc[,i]<VaRfr2_fwtdc[i]),cbind(seq(1,Ns),PGfr2_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwtdc[i]= mean(merge(which(PGfr3_fwtdc[,i]<VaRfr3_fwtdc[i]),cbind(seq(1,Ns),PGfr3_fwtdc[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwtdc[i]= mean(merge(which(PG_fwtdc[,i]<VaRCont_fwtdc[i]),cbind(seq(1,Ns),PG_fwtdc[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwtdc
+#VaRfr1_fwtdc
+#VaRfr2_fwtdc
+#CVaRCont_fwtdc
+#CVaRfr1_fwtdc
+#CVaRfr2_fwtdc
+
+
+#VaR Total
+Met
+VaRTotal_fwtdc=quantile(PGT_fwtdc,1-alpha,Ns)
+CVaRTotal_fwtdc= mean(merge(which(PGT_fwtdc<VaRTotal_fwtdc),cbind(seq(1,Ns),PGT_fwtdc), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwtdc=quantile(PGfr1T_fwtdc,1-alpha,Ns)
+CVaRTotalfr1_fwtdc= mean(PGfr1T_fwtdc[which(PGfr1T_fwtdc<VaRTotalfr1_fwtdc),])
+VaRTotalfr2_fwtdc=quantile(PGfr2T_fwtdc,1-alpha,Ns)
+CVaRTotalfr2_fwtdc= mean(PGfr2T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+VaRTotalfr3_fwtdc=quantile(PGfr3T_fwtdc,1-alpha,Ns)
+CVaRTotalfr3_fwtdc= mean(PGfr3T_fwtdc[which(PGfr2T_fwtdc<VaRTotalfr2_fwtdc),])
+
+
+#cbind(VaRTotal_fwtdc,sum(V0_fwtdc), VaRCont_fwtdc, V0_fwtdc)
+#cbind(CVaRTotal_fwtdc,sum(V0_fwtdc), CVaRCont_fwtdc, V0_fwtdc)
+cbind(VaRTotal_fwtdc,VaRTotalfr1_fwtdc,VaRTotalfr2_fwtdc,VaRTotalfr3_fwtdc)
+cbind(CVaRTotal_fwtdc,CVaRTotalfr1_fwtdc,CVaRTotalfr2_fwtdc,CVaRTotalfr3_fwtdc)
+```
+
+### Forwards IPC
+```{r}
+#Cálculo de matriz de pérdidas y ganancias FUTUROS IPC
+m=ncol(plazos_fwd_ind)  #PASO CLAVE
+X_s_fwind=matrix(0,Ns,n_if[6]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_fwind=matrix(0,Ns,m)
+Vfr1_fwind=matrix(0,Ns,m)
+Vfr2_fwind=matrix(0,Ns,m)
+Vfr3_fwind=matrix(0,Ns,m)
+PG_fwind=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_fwind=matrix(0,Ns,m)
+PGfr2_fwind=matrix(0,Ns,m)
+PGfr3_fwind=matrix(0,Ns,m)
+PGT_fwind=matrix(0,Ns,1)
+PGfr1T_fwind=matrix(0,Ns,1)
+PGfr2T_fwind=matrix(0,Ns,1)
+PGfr3T_fwind=matrix(0,Ns,1)
+
+DeltaX_s_fwind=DeltaX_s[,sum(n_if[1:5],1):sum(n_if[1:6])]  #PASO CLAVE
+x0_fwind=X_futind[1,] #PASO CLAVE
+
+
+for (i in 1:Ns)
+{
+  X_s_fwind[i,]=x0_fwind*(1+DeltaX_s_fwind[i,])
+  #PASO CLAVE
+  V_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind     
+  Vfr1_fwind[i,]=futuroTC(plazos_fwd_ind,X_s_fwind[i,1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr2_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],X_s_fwind[i,(n_if[6]/3+1):(n_if[6]*2/3)],x0_fwind[(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  #PASO CLAVE
+  Vfr3_fwind[i,]=futuroTC(plazos_fwd_ind,x0_fwind[1:(n_if[6]/3)],x0_fwind[(n_if[6]/3+1):(n_if[6]*2/3)],X_s_fwind[i,(n_if[6]*2/3+1):n_if[6]],kst_fwd_ind)*contratos_fwd_ind*nominal_fwd_ind
+  PG_fwind[i,]=V_fwind[i,]-V0_fwind
+  PGfr1_fwind[i,]=Vfr1_fwind[i,]-V0_fwind
+  PGfr2_fwind[i,]=Vfr2_fwind[i,]-V0_fwind
+  PGfr3_fwind[i,]=Vfr3_fwind[i,]-V0_fwind
+  PGT_fwind[i,]=sum(PG_fwind[i,])
+  PGfr1T_fwind[i,]=sum(PGfr1_fwind[i,])
+  PGfr2T_fwind[i,]=sum(PGfr2_fwind[i,])
+  PGfr3T_fwind[i,]=sum(PGfr3_fwind[i,])
+}
+
+
+PG_fwind[1:5,]
+#PGfr1_fwind[1:5,]
+#PGfr2_fwind[1:5,]
+#PGT_fwind[1:5,]
+
+
+
+#VaR por posición
+VaRCont_fwind=matrix(0,1,m)
+VaRfr1_fwind=matrix(0,1,m)
+VaRfr2_fwind=matrix(0,1,m)
+VaRfr3_fwind=matrix(0,1,m)
+CVaRCont_fwind=matrix(0,1,m)
+CVaRfr1_fwind=matrix(0,1,m)
+CVaRfr2_fwind=matrix(0,1,m)
+CVaRfr3_fwind=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_fwind[i]=quantile(PG_fwind[,i],1-alpha,Ns)
+  VaRfr1_fwind[i]=quantile(PGfr1_fwind[,i],1-alpha,Ns)
+  VaRfr2_fwind[i]=quantile(PGfr2_fwind[,i],1-alpha,Ns)
+  VaRfr3_fwind[i]=quantile(PGfr3_fwind[,i],1-alpha,Ns)
+  CVaRfr1_fwind[i]= mean(merge(which(PGfr1_fwind[,i]<VaRfr1_fwind[i]),cbind(seq(1,Ns),PGfr1_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_fwind[i]= mean(merge(which(PGfr2_fwind[,i]<VaRfr2_fwind[i]),cbind(seq(1,Ns),PGfr2_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_fwind[i]= mean(merge(which(PGfr3_fwind[,i]<VaRfr3_fwind[i]),cbind(seq(1,Ns),PGfr3_fwind[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_fwind[i]= mean(merge(which(PG_fwind[,i]<VaRCont_fwind[i]),cbind(seq(1,Ns),PG_fwind[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_fwind
+#VaRfr1_fwind
+#VaRfr2_fwind
+#CVaRCont_fwind
+#CVaRfr1_fwind
+#CVaRfr2_fwind
+
+
+#VaR Total
+Met
+VaRTotal_fwind=quantile(PGT_fwind,1-alpha,Ns)
+CVaRTotal_fwind= mean(merge(which(PGT_fwind<VaRTotal_fwind),cbind(seq(1,Ns),PGT_fwind), by.x=1,by.y=1)[,2])
+VaRTotalfr1_fwind=quantile(PGfr1T_fwind,1-alpha,Ns)
+CVaRTotalfr1_fwind= mean(PGfr1T_fwind[which(PGfr1T_fwind<VaRTotalfr1_fwind),])
+VaRTotalfr2_fwind=quantile(PGfr2T_fwind,1-alpha,Ns)
+CVaRTotalfr2_fwind= mean(PGfr2T_fwind[which(PGfr2T_fwind<VaRTotalfr2_fwind),])
+VaRTotalfr3_fwind=quantile(PGfr3T_fwind,1-alpha,Ns)
+CVaRTotalfr3_fwind= mean(PGfr3T_fwind[which(PGfr3T_fwind<VaRTotalfr3_fwind),])
+
+
+#print(cbind(VaRTotal_fwind,sum(V0_fwind), VaRCont_fwind, V0_fwind))
+#print(cbind(CVaRTotal_fwind,sum(V0_fwind), CVaRCont_fwind, V0_fwind))
+print(cbind(VaRTotal_fwind,VaRTotalfr1_fwind,VaRTotalfr2_fwind,VaRTotalfr3_fwind))
+cbind(CVaRTotal_fwind,CVaRTotalfr1_fwind,CVaRTotalfr2_fwind,CVaRTotalfr3_fwind)
+
+
+```
+### Swaps
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias SWAP
+
+#riesgo del swap
+m=ncol(N)    #PASO CLAVE
+X_s_sw=matrix(0,Ns,n_if[7]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs)   #PASO CLAVE
+V_sw=matrix(0,Ns,m)
+Vfr1_sw=matrix(0,Ns,m)
+Vfr2_sw=matrix(0,Ns,m)
+PG_sw=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_sw=matrix(0,Ns,m)
+PGfr2_sw=matrix(0,Ns,m)
+PGT_sw=matrix(0,Ns,1)
+PGfr1T_sw=matrix(0,Ns,1)
+PGfr2T_sw=matrix(0,Ns,1)
+
+DeltaX_s_sw=DeltaX_s[,sum(n_if[1:6],1):sum(n_if[1:7])]    #PASO CLAVE
+x0_sw=as.numeric(c(XtfwdT[1,],Xvp[1,]))   #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_sw[i,]=x0_sw*(1+DeltaX_s_sw[i,])
+  #PASO CLAVE
+  V_sw[i,]=swap(por_swT, contratos_swT, nominal_swT, X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  Vfr1_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,X_s_sw[i,1:(n_if[7]/2)], tasafija_swT, plazocupon_swT, VTplazos_sw, Xvp[1,],N)
+  #PASO CLAVE
+  Vfr2_sw[i,]=swap(por_swT, contratos_swT, nominal_swT,  XtfwdT[1,], tasafija_swT, plazocupon_swT, VTplazos_sw, X_s_sw[i,(n_if[7]/2+1):(n_if[7])],N)
+  #PASO CLAVE
+  PG_sw[i,]=V_sw[i,]-V0_sw
+  PGfr1_sw[i,]=Vfr1_sw[i,]-V0_sw
+  PGfr2_sw[i,]=Vfr2_sw[i,]-V0_sw
+  PGT_sw[i,]=sum(PG_sw[i,])
+  PGfr1T_sw[i,]=sum(PGfr1_sw[i,])
+  PGfr2T_sw[i,]=sum(PGfr2_sw[i,])
+}
+
+
+
+PG_sw[1:5,]
+PGfr1_sw[1:5,]
+PGfr2_sw[1:5,]
+PGT_sw[1:5,]
+
+
+#VaR por posición
+VaRCont_sw=matrix(0,1,m)
+VaRfr1_sw=matrix(0,1,m)
+VaRfr2_sw=matrix(0,1,m)
+CVaRCont_sw=matrix(0,1,m)
+CVaRfr1_sw=matrix(0,1,m)
+CVaRfr2_sw=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_sw[i]=quantile(PG_sw[,i],1-alpha,Ns)
+  VaRfr1_sw[i]=quantile(PGfr1_sw[,i],1-alpha,Ns)
+  VaRfr2_sw[i]=quantile(PGfr2_sw[,i],1-alpha,Ns)
+  CVaRfr1_sw[i]= mean(merge(which(PGfr1_sw[,i]<VaRfr1_sw[i]),cbind(seq(1,Ns),PGfr1_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_sw[i]= mean(merge(which(PGfr2_sw[,i]<VaRfr2_sw[i]),cbind(seq(1,Ns),PGfr2_sw[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_sw[i]= mean(merge(which(PG_sw[,i]<VaRCont_sw[i]),cbind(seq(1,Ns),PG_sw[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_sw
+#VaRfr1_sw
+#VaRfr2_sw
+#CVaRCont_sw
+#CVaRfr1_sw
+#CVaRfr2_sw
+
+
+#VaR Total
+Met
+VaRTotal_sw=quantile(PGT_sw,1-alpha,Ns)
+CVaRTotal_sw= mean(merge(which(PGT_sw<VaRTotal_sw),cbind(seq(1,Ns),PGT_sw), by.x=1,by.y=1)[,2])
+VaRTotalfr1_sw=quantile(PGfr1T_sw,1-alpha,Ns)
+CVaRTotalfr1_sw= mean(PGfr1T_sw[which(PGfr1T_sw<VaRTotalfr1_sw),])
+VaRTotalfr2_sw=quantile(PGfr2T_sw,1-alpha,Ns)
+CVaRTotalfr2_sw= mean(PGfr2T_sw[which(PGfr2T_sw<VaRTotalfr2_sw),])
+
+
+cbind(VaRTotal_sw, VaRCont_sw)
+cbind(CVaRTotal_sw, CVaRCont_sw)
+cbind(VaRTotal_sw,VaRTotalfr1_sw,VaRTotalfr2_sw)
+cbind(CVaRTotal_sw,CVaRTotalfr1_sw,CVaRTotalfr2_sw)
+
+```
+
+### Opciones de tasa de interés
+
+```{r}
+#Cálculo de matriz de pérdidas y ganancias Opciones Tasa de interés
+#dimensión
+m=ncol(plazos_oir)  #PASO CLAVE
+X_s_oir=matrix(0,Ns,n_if[8]) #Factores de riesgo simulados con base en DeltaX_s x0*(1+Delta_Xs) #PASO CLAVE
+V_oir=matrix(0,Ns,m)
+Vfr1_oir=matrix(0,Ns,m)
+Vfr2_oir=matrix(0,Ns,m)
+Vfr3_oir=matrix(0,Ns,m)
+PG_oir=matrix(0,Ns,m) #Pèrdidas y ganancias
+PGfr1_oir=matrix(0,Ns,m)
+PGfr2_oir=matrix(0,Ns,m)
+PGfr3_oir=matrix(0,Ns,m)
+PGT_oir=matrix(0,Ns,1)
+PGfr1T_oir=matrix(0,Ns,1)
+PGfr2T_oir=matrix(0,Ns,1)
+PGfr3T_oir=matrix(0,Ns,1)
+
+DeltaX_s_oir=DeltaX_s[,sum(n_if[1:7],1):sum(n_if[1:8])]  #PASO CLAVE
+x0_oir=X_oir[1,] #PASO CLAVE
+
+for (i in 1:Ns)
+{
+  X_s_oir[i,]=x0_oir*(1+DeltaX_s_oir[i,])
+  #PASO CLAVE
+  V_oir[i,]=  opctint(X_s_oir[i,(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr1_oir[i,]=opctint(X_s_oir[i,(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr2_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],X_s_oir[i,((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,x0_oir[((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  #PASO CLAVE
+  Vfr3_oir[i,]=opctint(x0_oir[(1:(n_if[8]/3))],x0_oir[((n_if[8]/3+1):(n_if[8]/3*2))],K_oir,X_s_oir[i,((n_if[8]*2/3+1):(n_if[8]))],plazos_oir,cp_oir,cs_oir,pr_oir,dct_oir)*contratos_oir*nominal_oir #Valor del portafolio  
+  PG_oir[i,]=V_oir[i,]-V0_oir
+  PGfr1_oir[i,]=Vfr1_oir[i,]-V0_oir
+  PGfr2_oir[i,]=Vfr2_oir[i,]-V0_oir
+  PGfr3_oir[i,]=Vfr3_oir[i,]-V0_oir
+  PGT_oir[i,]=sum(PG_oir[i,])
+  PGfr1T_oir[i,]=sum(PGfr1_oir[i,])
+  PGfr2T_oir[i,]=sum(PGfr2_oir[i,])
+  PGfr3T_oir[i,]=sum(PGfr3_oir[i,])
+}
+
+
+
+PG_oir[1:5,]
+PGfr1_oir[1:5,]
+PGfr2_oir[1:5,]
+PGT_oir[1:5,]
+
+
+#VaR por posición
+VaRCont_oir=matrix(0,1,m)
+VaRfr1_oir=matrix(0,1,m)
+VaRfr2_oir=matrix(0,1,m)
+VaRfr3_oir=matrix(0,1,m)
+CVaRCont_oir=matrix(0,1,m)
+CVaRfr1_oir=matrix(0,1,m)
+CVaRfr2_oir=matrix(0,1,m)
+CVaRfr3_oir=matrix(0,1,m)
+for (i in (1:m))
+{
+  VaRCont_oir[i]=quantile(PG_oir[,i],1-alpha,Ns)
+  VaRfr1_oir[i]=quantile(PGfr1_oir[,i],1-alpha,Ns)
+  VaRfr2_oir[i]=quantile(PGfr2_oir[,i],1-alpha,Ns)
+  VaRfr3_oir[i]=quantile(PGfr3_oir[,i],1-alpha,Ns)
+  CVaRfr1_oir[i]= mean(merge(which(PGfr1_oir[,i]<VaRfr1_oir[i]),cbind(seq(1,Ns),PGfr1_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr2_oir[i]= mean(merge(which(PGfr2_oir[,i]<VaRfr2_oir[i]),cbind(seq(1,Ns),PGfr2_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRfr3_oir[i]= mean(merge(which(PGfr3_oir[,i]<VaRfr3_oir[i]),cbind(seq(1,Ns),PGfr3_oir[,i]), by.x=1,by.y=1)[,2])
+  CVaRCont_oir[i]= mean(merge(which(PG_oir[,i]<VaRCont_oir[i]),cbind(seq(1,Ns),PG_oir[,i]), by.x=1,by.y=1)[,2])
+}
+#Met
+#VaRCont_oir
+#VaRfr1_oir
+#VaRfr2_oir
+#CVaRCont_oir
+#CVaRfr1_oir
+#CVaRfr2_oir
+
+
+#VaR Total
+#Met
+VaRTotal_oir=quantile(PGT_oir,1-alpha,Ns)
+CVaRTotal_oir= mean(merge(which(PGT_oir<VaRTotal_oir),cbind(seq(1,Ns),PGT_oir), by.x=1,by.y=1)[,2])
+VaRTotalfr1_oir=quantile(PGfr1T_oir,1-alpha,Ns)
+CVaRTotalfr1_oir= mean(PGfr1T_oir[which(PGfr1T_oir<VaRTotalfr1_oir),])
+VaRTotalfr2_oir=quantile(PGfr2T_oir,1-alpha,Ns)
+CVaRTotalfr2_oir= mean(PGfr2T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+VaRTotalfr3_oir=quantile(PGfr3T_oir,1-alpha,Ns)
+CVaRTotalfr3_oir= mean(PGfr3T_oir[which(PGfr2T_oir<VaRTotalfr2_oir),])
+
+
+cbind(VaRTotal_oir, VaRCont_oir)
+cbind(CVaRTotal_oir, CVaRCont_oir)
+cbind(VaRTotal_oir,VaRTotalfr1_oir,VaRTotalfr2_oir,VaRTotalfr3_oir)
+cbind(CVaRTotal_oir,CVaRTotalfr1_oir,CVaRTotalfr2_oir,CVaRTotalfr3_oir)
+```
+### Riesgo total del portafolio
+```{r}
+#Medición de riesgo por factor de riesgo de todo el portafolios
+#Acciones
+#1. Acciones 
+#2. Forward de IPC
+PGPort_ACC=PGfr2T_acc_div+ PGfr3T_fwind #Pérdidas y ganancias
+VaRPort_ACC=quantile(PGPort_ACC,1-alpha,Ns) #VaR
+CVaRPort_ACC= mean(PGPort_ACC[which(PGPort_ACC<VaRPort_ACC)]) #CVaR
+
+print(VaRPort_ACC)
+print(CVaRPort_ACC)
+
+```
+
+```{r}
+#Tasa de Interés
+#1. Dado que swaps y bondes son de tasa de interés usaremos PGT_bd y PGT_sw
+#2. Para futuros usaremos PGfr1T_fwtdc y PGfr2T_fwtdc
+PGPort_TI=PGT_bd+PGT_sw+PGfr1T_fwtdc+PGfr2T_fwtdc +PGfr2T_fwind+PGfr1T_fwind +PGfr1T_oir +PGfr2T_oir #Pérdidas y ganancias
+VaRPort_TI=quantile(PGPort_TI,1-alpha,Ns) #VaR
+CVaRPort_TI= mean(PGPort_TI[which(PGPort_TI<VaRPort_TI)]) #CVaR
+print(VaRPort_TI)
+print(CVaRPort_TI)
+```
+
+```{r}
+#Tipo de cambio
+#1. Dado que swaps y bondes son de tasa de interés no usamos nada
+#2. Para futuros usamos sólo PGfr3T_fwtdc
+PGPort_TDC=PGfr1T_acc_div+PGfr3T_fwtdc  #Pérdidas y ganancias
+VaRPort_TDC=quantile(PGPort_TDC,1-alpha,Ns) #VaR
+CVaRPort_TDC= mean(PGPort_TDC[which(PGPort_TDC<VaRPort_TDC)]) #CVaR
+print(VaRPort_TDC)
+print(CVaRPort_TDC)
+
+
+```
+
+```{r}
+#Volatilidad
+#1. Sólo aplica la volatilidad de Opciones de tasa de interés
+
+PGPort_VOL=PGfr3T_oir  #Pérdidas y ganancias
+VaRPort_VOL=quantile(PGPort_VOL,1-alpha,Ns) #VaR
+CVaRPort_VOL= mean(PGPort_VOL[which(PGPort_VOL<VaRPort_VOL)]) #CVaR
+
+print(VaRPort_VOL)
+print(CVaRPort_VOL)
+
+```
+
+```{r}
+#Medición de riesgo de todo el portafolios
+#Sumar todos los PGT de todos los instrumentos
+
+PGT_Port=PGPort_ACC+PGPort_TI+PGPort_TDC+PGPort_VOL
+VaRTotal_Port=quantile(PGT_Port,1-alpha,Ns) #VaR
+CVaRTotal_Port= mean(PGT_Port[which(PGT_Port<VaRTotal_Port)]) #CVaR
+print(VaRTotal_Port)
+print(CVaRTotal_Port)
+print(V0T_port)
+```
+
+```
+
